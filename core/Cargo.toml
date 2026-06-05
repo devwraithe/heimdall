@@ -1,0 +1,6 @@
+[workspace]
+members = [
+    "observation",
+    "shared",
+]
+resolver = "2"
