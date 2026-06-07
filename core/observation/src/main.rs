@@ -1,10 +1,10 @@
-mod events;
 mod leader;
 
 use dotenvy::dotenv;
-use events::{NetworkEvent, SlotStatus, create_event_channel};
 use futures::{SinkExt, StreamExt};
+use intelligence::consumer::IntelligenceEngine;
 use leader::LeaderSchedule;
+use shared::events::{NetworkEvent, SlotStatus, create_event_channel};
 use std::{collections::HashMap, env};
 use tracing::{error, info, warn};
 use tracing_subscriber::FmtSubscriber;
@@ -34,23 +34,11 @@ async fn main() -> anyhow::Result<()> {
     // Create event channel
     let (tx, mut rx) = create_event_channel(EVENT_CHANNEL_BUFFER);
 
-    // Spawn event consumer — simulates L2 receiving events
+    // Spawn L2 intelligence engine
     tokio::spawn(async move {
-        while let Some(event) = rx.recv().await {
-            match event {
-                NetworkEvent::SlotUpdate { slot, status } => {
-                    info!(slot, ?status, "L2 received slot event");
-                }
-                NetworkEvent::LeaderWindow { slot, leader } => {
-                    info!(slot, %leader, "L2 received leader event");
-                }
-                NetworkEvent::BlockObserved { slot } => {
-                    info!(slot, "L2 received block event");
-                }
-                NetworkEvent::TransactionObserved { signature } => {
-                    info!(%signature, "L2 received transaction event");
-                }
-            }
+        let mut engine = IntelligenceEngine::new(rx);
+        if let Err(e) = engine.run().await {
+            error!(error = %e, "Intelligence engine error");
         }
     });
 
