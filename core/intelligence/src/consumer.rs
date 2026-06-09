@@ -1,18 +1,23 @@
-use crate::types::TransactionCandidate;
 use anyhow::Result;
-use shared::events::{EventReceiver, NetworkEvent};
+pub use shared::types::TransactionCandidate;
+use shared::{
+    events::{EventReceiver, NetworkEvent},
+    types::CandidateSender,
+};
 use std::collections::HashSet;
 use tracing::{info, warn};
 
 pub struct IntelligenceEngine {
     receiver: EventReceiver,
+    candidate_sender: CandidateSender,
     seen_candidates: HashSet<u64>,
 }
 
 impl IntelligenceEngine {
-    pub fn new(receiver: EventReceiver) -> Self {
+    pub fn new(receiver: EventReceiver, candidate_sender: CandidateSender) -> Self {
         Self {
             receiver,
+            candidate_sender,
             seen_candidates: HashSet::new(),
         }
     }
@@ -31,6 +36,10 @@ impl IntelligenceEngine {
                             created_at = candidate.created_at,
                             "Transaction candidate created"
                         );
+                        // Emit candidate to L3
+                        if let Err(e) = self.candidate_sender.send(candidate).await {
+                            warn!(error = %e, "Failed to send candidate to L3");
+                        }
                     }
                 }
                 NetworkEvent::SlotUpdate { slot, status } => {
@@ -46,7 +55,6 @@ impl IntelligenceEngine {
         }
 
         warn!("L1 event channel closed");
-
         Ok(())
     }
 }

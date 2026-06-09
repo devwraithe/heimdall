@@ -1,0 +1,18 @@
+[package]
+name = "submission"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.102"
+jito-sdk-rust = "0.3.2"
+rand = "0.10.1"
+solana-client = "4.0.0"
+solana-sdk = "4.0.1"
+solana-system-interface = { version = "3.0.0", features = ["bincode"] }
+tokio = { version = "1.52.3", features = ["full"] }
+tracing = "0.1.44"
+shared = { path = "../shared" }
+serde_json = "1.0.150"
+bincode = "1"
+base64 = "0.22.1"

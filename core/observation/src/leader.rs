@@ -2,7 +2,7 @@ use anyhow::Result;
 use solana_client::rpc_client::RpcClient;
 use solana_client::rpc_config::CommitmentConfig;
 use std::collections::HashMap;
-use tracing::{info, warn};
+use tracing::info;
 
 pub struct LeaderSchedule {
     /// Maps slot number to validator identity
@@ -42,7 +42,7 @@ impl LeaderSchedule {
     }
 
     /// Returns the leader for a specific slot
-    pub fn get_leader(&self, slot: u64) -> Option<&str> {
+    pub fn _get_leader(&self, slot: u64) -> Option<&str> {
         self.schedule.get(&slot).map(|s| s.as_str())
     }
 
