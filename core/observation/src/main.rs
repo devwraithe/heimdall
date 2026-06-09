@@ -3,12 +3,17 @@ mod leader;
 use dotenvy::dotenv;
 use futures::{SinkExt, StreamExt};
 use intelligence::consumer::IntelligenceEngine;
-use leader::LeaderSchedule;
 use shared::events::{NetworkEvent, SlotStatus, create_event_channel};
-use std::{collections::HashMap, env};
+use shared::types::create_candidate_channel;
+use solana_sdk::signature::read_keypair_file;
+use std::collections::HashMap;
+use std::env;
+use submission::blockhash::BlockhashMode;
+use submission::submitter::BundleSubmitter;
+use tonic::transport::ClientTlsConfig;
 use tracing::{error, info, warn};
 use tracing_subscriber::FmtSubscriber;
-use yellowstone_grpc_client::{ClientTlsConfig, GeyserGrpcClient};
+use yellowstone_grpc_client::GeyserGrpcClient;
 use yellowstone_grpc_proto::geyser::{
     SubscribeRequest, SubscribeRequestFilterSlots, SubscribeRequestPing,
     subscribe_update::UpdateOneof,
@@ -16,6 +21,7 @@ use yellowstone_grpc_proto::geyser::{
 
 const LEADER_WINDOW: u64 = 4;
 const EVENT_CHANNEL_BUFFER: usize = 1000;
+const CANDIDATE_CHANNEL_BUFFER: usize = 100;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -30,15 +36,45 @@ async fn main() -> anyhow::Result<()> {
     let endpoint = env::var("GRPC_ENDPOINT")?;
     let token = env::var("GRPC_X_TOKEN")?;
     let rpc_url = env::var("RPC_ENDPOINT")?;
+    let jito_url = env::var("JITO_URL")?;
+    let keypair_path =
+        env::var("KEYPAIR_PATH").unwrap_or_else(|_| "~/.config/solana/id.json".to_string());
+    let rpc_url_clone = rpc_url.clone();
 
-    // Create event channel
-    let (tx, mut rx) = create_event_channel(EVENT_CHANNEL_BUFFER);
+    // Load keypair
+    let keypair = read_keypair_file(&keypair_path)
+        .map_err(|e| anyhow::anyhow!("Failed to load keypair: {}", e))?;
+
+    // Create channels
+    let (event_tx, event_rx) = create_event_channel(EVENT_CHANNEL_BUFFER);
+    let (candidate_tx, mut candidate_rx) = create_candidate_channel(CANDIDATE_CHANNEL_BUFFER);
 
     // Spawn L2 intelligence engine
     tokio::spawn(async move {
-        let mut engine = IntelligenceEngine::new(rx);
+        let mut engine = IntelligenceEngine::new(event_rx, candidate_tx);
         if let Err(e) = engine.run().await {
             error!(error = %e, "Intelligence engine error");
+        }
+    });
+
+    // Spawn L3 bundle submitter
+    tokio::spawn(async move {
+        let submitter = BundleSubmitter::new(&rpc_url, &jito_url, keypair, BlockhashMode::Normal);
+
+        while let Some(candidate) = candidate_rx.recv().await {
+            match submitter.submit(candidate.slot, candidate.leader).await {
+                Ok(record) => {
+                    info!(
+                        bundle_id = %record.bundle_id,
+                        slot = record.slot,
+                        tip_lamports = record.tip_lamports,
+                        "Submission record created"
+                    );
+                }
+                Err(e) => {
+                    error!(error = %e, "Bundle submission failed");
+                }
+            }
         }
     });
 
@@ -73,7 +109,7 @@ async fn main() -> anyhow::Result<()> {
 
     info!("Slot stream open, listening...");
 
-    let mut leader_schedule: Option<LeaderSchedule> = None;
+    let mut leader_schedule: Option<leader::LeaderSchedule> = None;
 
     // Consume stream
     while let Some(message) = stream.next().await {
@@ -93,15 +129,16 @@ async fn main() -> anyhow::Result<()> {
                         let status = SlotStatus::from_u32(slot.status as u32);
 
                         // Emit slot event
-                        tx.send(NetworkEvent::SlotUpdate {
-                            slot: slot.slot,
-                            status: status.clone(),
-                        })
-                        .await?;
+                        event_tx
+                            .send(NetworkEvent::SlotUpdate {
+                                slot: slot.slot,
+                                status: status.clone(),
+                            })
+                            .await?;
 
                         // Fetch leader schedule once on first processed slot
                         if leader_schedule.is_none() && matches!(status, SlotStatus::Processed) {
-                            match LeaderSchedule::fetch(&rpc_url, slot.slot) {
+                            match leader::LeaderSchedule::fetch(&rpc_url_clone, slot.slot) {
                                 Ok(schedule) => {
                                     info!("Leader schedule ready");
                                     leader_schedule = Some(schedule);
@@ -116,11 +153,12 @@ async fn main() -> anyhow::Result<()> {
                                 let upcoming =
                                     schedule.get_upcoming_leaders(slot.slot, LEADER_WINDOW);
                                 for (upcoming_slot, leader) in upcoming {
-                                    tx.send(NetworkEvent::LeaderWindow {
-                                        slot: upcoming_slot,
-                                        leader: leader.to_string(),
-                                    })
-                                    .await?;
+                                    event_tx
+                                        .send(NetworkEvent::LeaderWindow {
+                                            slot: upcoming_slot,
+                                            leader: leader.to_string(),
+                                        })
+                                        .await?;
                                 }
                             }
                         }

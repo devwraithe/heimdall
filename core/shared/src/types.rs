@@ -1,3 +1,8 @@
+use tokio::sync::mpsc;
+
+pub type CandidateSender = mpsc::Sender<TransactionCandidate>;
+pub type CandidateReceiver = mpsc::Receiver<TransactionCandidate>;
+
 /// Represents a transaction candidate produced by L2
 /// and passed downstream to L3 via L5
 #[derive(Debug, Clone)]
@@ -23,4 +28,8 @@ impl TransactionCandidate {
             created_at,
         }
     }
+}
+
+pub fn create_candidate_channel(buffer: usize) -> (CandidateSender, CandidateReceiver) {
+    mpsc::channel(buffer)
 }

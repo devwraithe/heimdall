@@ -3,5 +3,6 @@ members = [
     "intelligence",
     "observation",
     "shared",
+    "submission",
 ]
 resolver = "2"
