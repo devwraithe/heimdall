@@ -4,7 +4,9 @@ use dotenvy::dotenv;
 use futures::{SinkExt, StreamExt};
 use intelligence::consumer::IntelligenceEngine;
 use shared::events::{NetworkEvent, SlotStatus, create_event_channel};
-use shared::types::create_candidate_channel;
+use shared::types::create_confirmation_channel;
+use shared::types::create_submission_channel;
+use shared::types::{SlotConfirmation, create_candidate_channel};
 use solana_sdk::signature::read_keypair_file;
 use std::collections::HashMap;
 use std::env;
@@ -13,6 +15,7 @@ use submission::submitter::BundleSubmitter;
 use tonic::transport::ClientTlsConfig;
 use tracing::{error, info, warn};
 use tracing_subscriber::FmtSubscriber;
+use tracking::tracker::OutcomeTracker;
 use yellowstone_grpc_client::GeyserGrpcClient;
 use yellowstone_grpc_proto::geyser::{
     SubscribeRequest, SubscribeRequestFilterSlots, SubscribeRequestPing,
@@ -22,6 +25,8 @@ use yellowstone_grpc_proto::geyser::{
 const LEADER_WINDOW: u64 = 4;
 const EVENT_CHANNEL_BUFFER: usize = 1000;
 const CANDIDATE_CHANNEL_BUFFER: usize = 100;
+const SUBMISSION_CHANNEL_BUFFER: usize = 100;
+const CONFIRMATION_CHANNEL_BUFFER: usize = 1000;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -48,6 +53,9 @@ async fn main() -> anyhow::Result<()> {
     // Create channels
     let (event_tx, event_rx) = create_event_channel(EVENT_CHANNEL_BUFFER);
     let (candidate_tx, mut candidate_rx) = create_candidate_channel(CANDIDATE_CHANNEL_BUFFER);
+    let (submission_tx, submission_rx) = create_submission_channel(SUBMISSION_CHANNEL_BUFFER);
+    let (confirmation_tx, confirmation_rx) =
+        create_confirmation_channel(CONFIRMATION_CHANNEL_BUFFER);
 
     // Spawn L2 intelligence engine
     tokio::spawn(async move {
@@ -70,11 +78,24 @@ async fn main() -> anyhow::Result<()> {
                         tip_lamports = record.tip_lamports,
                         "Submission record created"
                     );
+
+                    // Forward record to L4
+                    if let Err(e) = submission_tx.send(record).await {
+                        error!(error = %e, "Failed to send record to L4");
+                    }
                 }
                 Err(e) => {
                     error!(error = %e, "Bundle submission failed");
                 }
             }
+        }
+    });
+
+    // Spawn L4 outcome tracker
+    tokio::spawn(async move {
+        let mut tracker = OutcomeTracker::new(submission_rx, confirmation_rx);
+        if let Err(e) = tracker.run().await {
+            error!(error = %e, "Outcome tracker error");
         }
     });
 
@@ -135,6 +156,17 @@ async fn main() -> anyhow::Result<()> {
                                 status: status.clone(),
                             })
                             .await?;
+
+                        // Forward slot confirmation to L4
+                        if let Err(e) = confirmation_tx
+                            .send(SlotConfirmation {
+                                slot: slot.slot,
+                                commitment: slot.status as u32,
+                            })
+                            .await
+                        {
+                            warn!(error = %e, "Failed to send slot confirmation to L4");
+                        }
 
                         // Fetch leader schedule once on first processed slot
                         if leader_schedule.is_none() && matches!(status, SlotStatus::Processed) {

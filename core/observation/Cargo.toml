@@ -18,3 +18,4 @@ solana-sdk = "4.0.1"
 shared = { path = "../shared" }
 intelligence = { path = "../intelligence" }
 submission = { path = "../submission" }
+tracking = { path = "../tracking" }

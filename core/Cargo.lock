@@ -2279,6 +2279,7 @@ dependencies = [
  "tonic",
  "tracing",
  "tracing-subscriber",
+ "tracking",
  "yellowstone-grpc-client",
  "yellowstone-grpc-proto",
 ]
@@ -6055,6 +6056,16 @@ dependencies = [
  "tracing",
  "tracing-core",
  "tracing-log",
+]
+
+[[package]]
+name = "tracking"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "shared",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

@@ -33,3 +33,68 @@ impl TransactionCandidate {
 pub fn create_candidate_channel(buffer: usize) -> (CandidateSender, CandidateReceiver) {
     mpsc::channel(buffer)
 }
+
+#[derive(Debug, Clone)]
+pub struct SubmissionRecord {
+    /// Jito bundle ID returned after submission
+    pub bundle_id: String,
+    /// Target slot this bundle was submitted for
+    pub slot: u64,
+    /// Validator identity leading the target slot
+    pub leader: String,
+    /// Tip amount paid in lamports
+    pub tip_lamports: u64,
+    /// Blockhash used when constructing the bundle
+    pub blockhash: String,
+    /// Unix timestamp of submission
+    pub submitted_at: u64,
+}
+
+impl SubmissionRecord {
+    pub fn new(
+        bundle_id: String,
+        slot: u64,
+        leader: String,
+        tip_lamports: u64,
+        blockhash: String,
+    ) -> Self {
+        let submitted_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        Self {
+            bundle_id,
+            slot,
+            leader,
+            tip_lamports,
+            blockhash,
+            submitted_at,
+        }
+    }
+}
+
+pub type SubmissionSender = mpsc::Sender<SubmissionRecord>;
+pub type SubmissionReceiver = mpsc::Receiver<SubmissionRecord>;
+
+pub fn create_submission_channel(buffer: usize) -> (SubmissionSender, SubmissionReceiver) {
+    mpsc::channel(buffer)
+}
+
+/// Carries a slot update from L1 to L4 for bundle confirmation.
+/// Uses raw commitment u32 to avoid circular dependency with tracking crate.
+/// L4 converts to CommitmentStage internally.
+#[derive(Debug, Clone)]
+pub struct SlotConfirmation {
+    /// The slot number that progressed
+    pub slot: u64,
+    /// Raw commitment level: 0=Processed, 1=Confirmed, 2=Finalized
+    pub commitment: u32,
+}
+
+pub type ConfirmationSender = mpsc::Sender<SlotConfirmation>;
+pub type ConfirmationReceiver = mpsc::Receiver<SlotConfirmation>;
+
+pub fn create_confirmation_channel(buffer: usize) -> (ConfirmationSender, ConfirmationReceiver) {
+    mpsc::channel(buffer)
+}
