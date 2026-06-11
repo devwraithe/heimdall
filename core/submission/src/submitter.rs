@@ -2,12 +2,12 @@ use crate::{
     blockhash::{BlockhashFetcher, BlockhashMode},
     bundle::BundleConstructor,
     tip::TipCalculator,
-    types::SubmissionRecord,
 };
 use anyhow::Result;
 use base64::Engine;
 use jito_sdk_rust::JitoJsonRpcSDK;
 use serde_json::json;
+pub use shared::types::SubmissionRecord;
 use tracing::{error, info};
 
 pub struct BundleSubmitter {

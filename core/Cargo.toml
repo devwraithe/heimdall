@@ -4,5 +4,6 @@ members = [
     "observation",
     "shared",
     "submission",
+    "tracking",
 ]
 resolver = "2"
