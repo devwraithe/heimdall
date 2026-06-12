@@ -98,3 +98,16 @@ pub type ConfirmationReceiver = mpsc::Receiver<SlotConfirmation>;
 pub fn create_confirmation_channel(buffer: usize) -> (ConfirmationSender, ConfirmationReceiver) {
     mpsc::channel(buffer)
 }
+
+/// Carries tip median updates from L3 to L5
+#[derive(Debug, Clone)]
+pub struct TipUpdate {
+    pub median_lamports: u64,
+}
+
+pub type TipSender = mpsc::Sender<TipUpdate>;
+pub type TipReceiver = mpsc::Receiver<TipUpdate>;
+
+pub fn create_tip_channel(buffer: usize) -> (TipSender, TipReceiver) {
+    mpsc::channel(buffer)
+}
