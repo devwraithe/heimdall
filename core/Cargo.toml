@@ -3,6 +3,7 @@ members = [
     "intelligence",
     "observation",
     "shared",
+    "state",
     "submission",
     "tracking",
 ]
