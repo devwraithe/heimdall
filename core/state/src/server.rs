@@ -30,7 +30,7 @@ impl OperationalStateService for StateServer {
 
     async fn subscribe(
         &self,
-        request: Request<SubscribeRequest>,
+        _request: Request<SubscribeRequest>,
     ) -> Result<Response<Self::SubscribeStream>, Status> {
         info!("L6 agent subscribed to operational state stream");
 

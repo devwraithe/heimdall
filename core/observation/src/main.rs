@@ -7,12 +7,18 @@ use shared::events::{NetworkEvent, SlotStatus, create_event_channel};
 use shared::types::create_confirmation_channel;
 use shared::types::create_submission_channel;
 use shared::types::{SlotConfirmation, create_candidate_channel};
+use shared::types::{TipUpdate, create_tip_channel};
 use solana_sdk::signature::read_keypair_file;
+use state::engine::OperationalState;
+use state::heimdall::operational_state_service_server::OperationalStateServiceServer;
+use state::server::StateServer;
 use std::collections::HashMap;
 use std::env;
+use std::sync::{Arc, Mutex};
 use submission::blockhash::BlockhashMode;
 use submission::submitter::BundleSubmitter;
 use tonic::transport::ClientTlsConfig;
+use tonic::transport::Server;
 use tracing::{error, info, warn};
 use tracing_subscriber::FmtSubscriber;
 use tracking::tracker::OutcomeTracker;
@@ -27,6 +33,8 @@ const EVENT_CHANNEL_BUFFER: usize = 1000;
 const CANDIDATE_CHANNEL_BUFFER: usize = 100;
 const SUBMISSION_CHANNEL_BUFFER: usize = 100;
 const CONFIRMATION_CHANNEL_BUFFER: usize = 1000;
+const TIP_CHANNEL_BUFFER: usize = 100;
+const GRPC_PORT: u16 = 50051;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -50,12 +58,16 @@ async fn main() -> anyhow::Result<()> {
     let keypair = read_keypair_file(&keypair_path)
         .map_err(|e| anyhow::anyhow!("Failed to load keypair: {}", e))?;
 
+    // Create shared operational state
+    let operational_state = Arc::new(Mutex::new(OperationalState::new()));
+
     // Create channels
     let (event_tx, event_rx) = create_event_channel(EVENT_CHANNEL_BUFFER);
     let (candidate_tx, mut candidate_rx) = create_candidate_channel(CANDIDATE_CHANNEL_BUFFER);
     let (submission_tx, submission_rx) = create_submission_channel(SUBMISSION_CHANNEL_BUFFER);
     let (confirmation_tx, confirmation_rx) =
         create_confirmation_channel(CONFIRMATION_CHANNEL_BUFFER);
+    let (tip_tx, mut tip_rx) = create_tip_channel(TIP_CHANNEL_BUFFER);
 
     // Spawn L2 intelligence engine
     tokio::spawn(async move {
@@ -80,8 +92,18 @@ async fn main() -> anyhow::Result<()> {
                     );
 
                     // Forward record to L4
-                    if let Err(e) = submission_tx.send(record).await {
+                    if let Err(e) = submission_tx.send(record.clone()).await {
                         error!(error = %e, "Failed to send record to L4");
+                    }
+
+                    // Send tip update to L5
+                    if let Err(e) = tip_tx
+                        .send(TipUpdate {
+                            median_lamports: record.tip_lamports,
+                        })
+                        .await
+                    {
+                        warn!(error = %e, "Failed to send tip update to L5");
                     }
                 }
                 Err(e) => {
@@ -96,6 +118,31 @@ async fn main() -> anyhow::Result<()> {
         let mut tracker = OutcomeTracker::new(submission_rx, confirmation_rx);
         if let Err(e) = tracker.run().await {
             error!(error = %e, "Outcome tracker error");
+        }
+    });
+
+    // Spawn gRPC server
+    let grpc_state = Arc::clone(&operational_state);
+    tokio::spawn(async move {
+        let addr = format!("0.0.0.0:{}", GRPC_PORT).parse().unwrap();
+        let server = StateServer::new(grpc_state);
+
+        info!(port = GRPC_PORT, "L5 gRPC server starting");
+
+        Server::builder()
+            .add_service(OperationalStateServiceServer::new(server))
+            .serve(addr)
+            .await
+            .expect("L5 gRPC server failed");
+    });
+
+    // Spawn tip update consumer
+    let tip_state = Arc::clone(&operational_state);
+    tokio::spawn(async move {
+        while let Some(update) = tip_rx.recv().await {
+            if let Ok(mut state) = tip_state.lock() {
+                state.update_tip(update.median_lamports);
+            }
         }
     });
 
@@ -156,6 +203,14 @@ async fn main() -> anyhow::Result<()> {
                                 status: status.clone(),
                             })
                             .await?;
+
+                        // Feed slot data to L5
+                        if let Ok(mut state) = operational_state.lock() {
+                            state.update_slot(
+                                slot.slot,
+                                slot.status == 2, // 2 = Finalized
+                            );
+                        }
 
                         // Forward slot confirmation to L4
                         if let Err(e) = confirmation_tx

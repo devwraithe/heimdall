@@ -2274,6 +2274,7 @@ dependencies = [
  "shared",
  "solana-client",
  "solana-sdk",
+ "state",
  "submission",
  "tokio",
  "tonic",
