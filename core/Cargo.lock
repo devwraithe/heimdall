@@ -3371,6 +3371,7 @@ name = "shared"
 version = "0.1.0"
 dependencies = [
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -6080,6 +6081,8 @@ name = "tracking"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "jito-sdk-rust",
+ "serde_json",
  "shared",
  "tokio",
  "tracing",

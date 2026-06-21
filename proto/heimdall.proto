@@ -1,0 +1,32 @@
+syntax = "proto3";
+
+package heimdall;
+
+// A summary of a single bundle outcome for the AI agent
+message BundleOutcomeSummary {
+    string bundle_id = 1;
+    uint64 slot = 2;
+    string stage = 3;
+    string failure_reason = 4;
+    uint64 tip_lamports = 5;
+    string blockhash = 6;
+    uint64 submitted_at = 7;
+}
+
+// The operational snapshot streamed from L5 to L6
+message OperationalSnapshot {
+    uint64 current_slot = 1;
+    uint64 latest_finalized_slot = 2;
+    uint64 tip_median_lamports = 3;
+    repeated BundleOutcomeSummary recent_outcomes = 4;
+    uint32 active_bundle_count = 5;
+    uint64 snapshot_at = 6;
+}
+
+// Empty request — L6 subscribes and receives a stream
+message SubscribeRequest {}
+
+// The L5 streaming service
+service OperationalStateService {
+    rpc Subscribe(SubscribeRequest) returns (stream OperationalSnapshot);
+}

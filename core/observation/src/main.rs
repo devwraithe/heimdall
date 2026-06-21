@@ -3,13 +3,13 @@ mod leader;
 use dotenvy::dotenv;
 use futures::{SinkExt, StreamExt};
 use intelligence::consumer::IntelligenceEngine;
+use shared::engine::OperationalState;
 use shared::events::{NetworkEvent, SlotStatus, create_event_channel};
-use shared::types::create_confirmation_channel;
 use shared::types::create_submission_channel;
+use shared::types::{InfraConfig, create_confirmation_channel};
 use shared::types::{SlotConfirmation, create_candidate_channel};
 use shared::types::{TipUpdate, create_tip_channel};
 use solana_sdk::signature::read_keypair_file;
-use state::engine::OperationalState;
 use state::heimdall::operational_state_service_server::OperationalStateServiceServer;
 use state::server::StateServer;
 use std::collections::HashMap;
@@ -60,6 +60,10 @@ async fn main() -> anyhow::Result<()> {
 
     // Create shared operational state
     let operational_state = Arc::new(Mutex::new(OperationalState::new()));
+    let state_for_grpc = Arc::clone(&operational_state);
+    let state_for_tip = Arc::clone(&operational_state);
+    let state_for_l4 = Arc::clone(&operational_state);
+    let state_for_slots = Arc::clone(&operational_state);
 
     // Create channels
     let (event_tx, event_rx) = create_event_channel(EVENT_CHANNEL_BUFFER);
@@ -77,9 +81,18 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
+    let jito_url_for_l3 = jito_url.clone();
+    let jito_url_for_l4 = jito_url.clone();
+
     // Spawn L3 bundle submitter
     tokio::spawn(async move {
-        let submitter = BundleSubmitter::new(&rpc_url, &jito_url, keypair, BlockhashMode::Normal);
+        let submitter = BundleSubmitter::new(
+            &rpc_url,
+            &jito_url_for_l3,
+            keypair,
+            BlockhashMode::Normal,
+            // BlockhashMode::FaultInjected,
+        );
 
         while let Some(candidate) = candidate_rx.recv().await {
             match submitter.submit(candidate.slot, candidate.leader).await {
@@ -115,14 +128,21 @@ async fn main() -> anyhow::Result<()> {
 
     // Spawn L4 outcome tracker
     tokio::spawn(async move {
-        let mut tracker = OutcomeTracker::new(submission_rx, confirmation_rx);
+        let mut tracker = OutcomeTracker::new(
+            submission_rx,
+            confirmation_rx,
+            InfraConfig {
+                jito_url: jito_url_for_l4,
+            },
+            Arc::clone(&state_for_l4),
+        );
         if let Err(e) = tracker.run().await {
             error!(error = %e, "Outcome tracker error");
         }
     });
 
     // Spawn gRPC server
-    let grpc_state = Arc::clone(&operational_state);
+    let grpc_state = Arc::clone(&state_for_grpc);
     tokio::spawn(async move {
         let addr = format!("0.0.0.0:{}", GRPC_PORT).parse().unwrap();
         let server = StateServer::new(grpc_state);
@@ -137,7 +157,7 @@ async fn main() -> anyhow::Result<()> {
     });
 
     // Spawn tip update consumer
-    let tip_state = Arc::clone(&operational_state);
+    let tip_state = Arc::clone(&state_for_tip);
     tokio::spawn(async move {
         while let Some(update) = tip_rx.recv().await {
             if let Ok(mut state) = tip_state.lock() {
@@ -205,7 +225,7 @@ async fn main() -> anyhow::Result<()> {
                             .await?;
 
                         // Feed slot data to L5
-                        if let Ok(mut state) = operational_state.lock() {
+                        if let Ok(mut state) = state_for_slots.lock() {
                             state.update_slot(
                                 slot.slot,
                                 slot.status == 2, // 2 = Finalized

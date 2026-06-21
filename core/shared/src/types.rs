@@ -1,5 +1,5 @@
+use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
-
 pub type CandidateSender = mpsc::Sender<TransactionCandidate>;
 pub type CandidateReceiver = mpsc::Receiver<TransactionCandidate>;
 
@@ -110,4 +110,23 @@ pub type TipReceiver = mpsc::Receiver<TipUpdate>;
 
 pub fn create_tip_channel(buffer: usize) -> (TipSender, TipReceiver) {
     mpsc::channel(buffer)
+}
+
+/// Shared infrastructure configuration
+pub struct InfraConfig {
+    pub jito_url: String,
+}
+
+/// Plain data struct representing a bundle outcome.
+/// Lives in shared so all crates can reference it
+/// without depending on protobuf-generated types.
+#[derive(Debug, Clone)]
+pub struct BundleOutcomeSummary {
+    pub bundle_id: String,
+    pub slot: u64,
+    pub stage: String,
+    pub failure_reason: String,
+    pub tip_lamports: u64,
+    pub blockhash: String,
+    pub submitted_at: u64,
 }
