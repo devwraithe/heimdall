@@ -1,8 +1,13 @@
 use crate::types::{BundleOutcome, CommitmentStage};
 use anyhow::Result;
-use shared::types::{ConfirmationReceiver, SlotConfirmation, SubmissionReceiver, SubmissionRecord};
+use jito_sdk_rust::JitoJsonRpcSDK;
+use shared::engine::OperationalState;
+use shared::types::{
+    ConfirmationReceiver, InfraConfig, SlotConfirmation, SubmissionReceiver, SubmissionRecord,
+};
 use std::collections::HashMap;
-use tracing::{info, warn};
+use std::sync::{Arc, Mutex};
+use tracing::{error, info, warn};
 
 /// Maintains a live registry of all in-flight bundles.
 /// Receives SubmissionRecords from L3 and tracks each
@@ -15,15 +20,41 @@ pub struct OutcomeTracker {
     bundles: HashMap<String, BundleOutcome>,
     /// Latest finalized slot seen by the tracker
     latest_finalized_slot: u64,
+    jito_url: String,
+    operational_state: Arc<Mutex<OperationalState>>,
 }
 
 impl OutcomeTracker {
-    pub fn new(receiver: SubmissionReceiver, confirmation_receiver: ConfirmationReceiver) -> Self {
+    pub fn new(
+        receiver: SubmissionReceiver,
+        confirmation_receiver: ConfirmationReceiver,
+        config: InfraConfig,
+        operational_state: Arc<Mutex<OperationalState>>,
+    ) -> Self {
         Self {
             receiver,
             confirmation_receiver,
             bundles: HashMap::new(),
             latest_finalized_slot: 0,
+            jito_url: config.jito_url,
+            operational_state,
+        }
+    }
+
+    async fn _poll_bundle_status(&self, bundle_id: String) {
+        // Wait 2 seconds for SVM to process
+        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+
+        let client = JitoJsonRpcSDK::new(&self.jito_url, None);
+        let bundle_ids = vec![bundle_id.clone()];
+
+        match client.get_bundle_statuses(bundle_ids).await {
+            Ok(response) => {
+                info!(bundle_id = %bundle_id, response = %response, "Bundle status polled");
+            }
+            Err(e) => {
+                error!(bundle_id = %bundle_id, error = %e, "Failed to poll bundle status");
+            }
         }
     }
 
@@ -48,7 +79,51 @@ impl OutcomeTracker {
             "Bundle registered for tracking"
         );
 
-        self.bundles.insert(record.bundle_id, outcome);
+        let bundle_id_1 = record.bundle_id.clone();
+        let bundle_id_2 = record.bundle_id.clone();
+
+        self.bundles.insert(bundle_id_1, outcome);
+
+        // Spawn status poll
+        let bundle_id = bundle_id_2;
+        let jito_url = self.jito_url.clone();
+        let operational_state = Arc::clone(&self.operational_state);
+
+        tokio::spawn(async move {
+            let client = JitoJsonRpcSDK::new(&jito_url, None);
+            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+            let bundle_ids = vec![bundle_id.clone()];
+
+            match client.get_bundle_statuses(bundle_ids).await {
+                Ok(response) => {
+                    let value = &response["result"]["value"];
+                    if value.as_array().map(|a| a.is_empty()).unwrap_or(true) {
+                        // Empty value = bundle not found = failure
+                        warn!(
+                            bundle_id = %bundle_id,
+                            "Bundle not found in Jito — classifying as ExpiredBlockhash"
+                        );
+                        if let Ok(mut state) = operational_state.lock() {
+                            state.record_outcome(shared::types::BundleOutcomeSummary {
+                                bundle_id: bundle_id.clone(),
+                                slot: 0,
+                                stage: "Failed".to_string(),
+                                failure_reason: "ExpiredBlockhash".to_string(),
+                                tip_lamports: 0,
+                                blockhash: String::new(),
+                                submitted_at: 0,
+                            });
+                            info!(bundle_id = %bundle_id, "Failed outcome pushed to L5");
+                        }
+                    } else {
+                        info!(bundle_id = %bundle_id, response = %response, "Bundle status polled");
+                    }
+                }
+                Err(e) => {
+                    error!(bundle_id = %bundle_id, error = %e, "Failed to poll bundle status")
+                }
+            }
+        });
     }
 
     /// Updates a bundle's commitment stage when a stream

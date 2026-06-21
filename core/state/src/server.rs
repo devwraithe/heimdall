@@ -1,8 +1,9 @@
-use crate::engine::OperationalState;
+use crate::engine::to_snapshot;
 use crate::heimdall::{
     OperationalSnapshot, SubscribeRequest,
     operational_state_service_server::OperationalStateService,
 };
+use shared::engine::OperationalState;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
@@ -41,7 +42,7 @@ impl OperationalStateService for StateServer {
             loop {
                 let snapshot = {
                     match state.lock() {
-                        Ok(s) => s.snapshot(),
+                        Ok(s) => to_snapshot(&*s),
                         Err(e) => {
                             error!(error = %e, "Failed to lock state");
                             break;

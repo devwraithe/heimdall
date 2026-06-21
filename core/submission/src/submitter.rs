@@ -60,6 +60,7 @@ impl BundleSubmitter {
             Ok(response) => {
                 let id = response["result"].as_str().unwrap_or("unknown").to_string();
                 info!(bundle_id = %id, slot, "Bundle submitted");
+                info!(response = %response, "Raw Jito response for fault injection");
                 id
             }
             Err(e) => {
