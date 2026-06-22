@@ -1,3 +1,5 @@
+use crate::lifecycle_log::write_entry;
+use crate::types::LifecycleEntry;
 use crate::types::{BundleOutcome, CommitmentStage};
 use anyhow::Result;
 use jito_sdk_rust::JitoJsonRpcSDK;
@@ -103,6 +105,30 @@ impl OutcomeTracker {
                             bundle_id = %bundle_id,
                             "Bundle not found in Jito — classifying as ExpiredBlockhash"
                         );
+
+                        // Write failure lifecycle entry
+                        let entry = LifecycleEntry {
+                            bundle_id: bundle_id.clone(),
+                            slot: 0,
+                            leader: String::new(),
+                            tip_lamports: 0,
+                            blockhash: String::new(),
+                            submitted_at: 0,
+                            processed_at: None,
+                            confirmed_at: None,
+                            finalized_at: None,
+                            processed_slot: None,
+                            confirmed_slot: None,
+                            finalized_slot: None,
+                            latency_processed_secs: None,
+                            latency_confirmed_secs: None,
+                            latency_finalized_secs: None,
+                            status: "Failed".to_string(),
+                            failure_reason: Some("ExpiredBlockhash".to_string()),
+                        };
+
+                        write_entry(&entry);
+
                         if let Ok(mut state) = operational_state.lock() {
                             state.record_outcome(shared::types::BundleOutcomeSummary {
                                 bundle_id: bundle_id.clone(),
@@ -189,6 +215,36 @@ impl OutcomeTracker {
                     latency_finalized = ?outcome.latency_finalized(),
                     "Bundle lifecycle complete, evicted from registry"
                 );
+
+                // Write to lifecycle log
+                let entry = LifecycleEntry {
+                    bundle_id: outcome.bundle_id.clone(),
+                    slot: outcome.slot,
+                    leader: outcome.leader.clone(),
+                    tip_lamports: outcome.tip_lamports,
+                    blockhash: outcome.blockhash.clone(),
+                    submitted_at: outcome.submitted_at,
+                    processed_at: outcome.processed_at,
+                    confirmed_at: outcome.confirmed_at,
+                    finalized_at: outcome.finalized_at,
+                    processed_slot: outcome.processed_slot,
+                    confirmed_slot: outcome.confirmed_slot,
+                    finalized_slot: outcome.finalized_slot,
+                    latency_processed_secs: outcome.latency_processed(),
+                    latency_confirmed_secs: outcome.latency_confirmed(),
+                    latency_finalized_secs: outcome.latency_finalized(),
+                    status: match &outcome.stage {
+                        CommitmentStage::Finalized => "Finalized".to_string(),
+                        CommitmentStage::Failed(_) => "Failed".to_string(),
+                        _ => "Unknown".to_string(),
+                    },
+                    failure_reason: match &outcome.stage {
+                        CommitmentStage::Failed(reason) => Some(format!("{:?}", reason)),
+                        _ => None,
+                    },
+                };
+
+                write_entry(&entry);
             }
         }
     }

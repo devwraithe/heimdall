@@ -6082,6 +6082,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "jito-sdk-rust",
+ "serde",
  "serde_json",
  "shared",
  "tokio",

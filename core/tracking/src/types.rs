@@ -117,3 +117,30 @@ impl BundleOutcome {
             .map(|(f, c)| f.saturating_sub(c))
     }
 }
+
+/// A complete lifecycle record written to the log
+/// when a bundle is evicted from the registry.
+#[derive(Debug, serde::Serialize)]
+pub struct LifecycleEntry {
+    pub bundle_id: String,
+    pub slot: u64,
+    pub leader: String,
+    pub tip_lamports: u64,
+    pub blockhash: String,
+    /// Commitment progression timestamps
+    pub submitted_at: u64,
+    pub processed_at: Option<u64>,
+    pub confirmed_at: Option<u64>,
+    pub finalized_at: Option<u64>,
+    /// Commitment progression slots
+    pub processed_slot: Option<u64>,
+    pub confirmed_slot: Option<u64>,
+    pub finalized_slot: Option<u64>,
+    /// Latency deltas in seconds
+    pub latency_processed_secs: Option<u64>,
+    pub latency_confirmed_secs: Option<u64>,
+    pub latency_finalized_secs: Option<u64>,
+    /// Outcome
+    pub status: String,
+    pub failure_reason: Option<String>,
+}
