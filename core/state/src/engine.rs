@@ -21,12 +21,19 @@ pub fn to_snapshot(state: &OperationalState) -> OperationalSnapshot {
                 slot: o.slot,
                 stage: o.stage.clone(),
                 failure_reason: o.failure_reason.clone(),
+                failure_stage: o.failure_stage.clone(),
+                recovery: o.recovery.clone(),
                 tip_lamports: o.tip_lamports,
                 blockhash: o.blockhash.clone(),
                 submitted_at: o.submitted_at,
+                original_bundle_id: o.original_bundle_id.clone(),
+                retry_attempt: o.retry_attempt,
             })
             .collect(),
         active_bundle_count: state.active_bundle_count,
         snapshot_at,
+        total_retries: state.total_retries,
+        total_retries_succeeded: state.total_retries_succeeded,
+        total_retries_exhausted: state.total_retries_exhausted,
     }
 }

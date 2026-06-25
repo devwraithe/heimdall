@@ -1,6 +1,5 @@
 use crate::types::BundleOutcomeSummary;
 use std::collections::VecDeque;
-use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::info;
 
 const MAX_RECENT_OUTCOMES: usize = 20;
@@ -11,16 +10,30 @@ pub struct OperationalState {
     pub tip_median_lamports: u64,
     pub recent_outcomes: VecDeque<BundleOutcomeSummary>,
     pub active_bundle_count: u32,
+    /// Retry metrics
+    pub total_retries: u32,
+    pub total_retries_succeeded: u32,
+    pub total_retries_exhausted: u32,
+    pub started_at: u64,
 }
 
 impl OperationalState {
     pub fn new() -> Self {
+        let started_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
         Self {
             current_slot: 0,
             latest_finalized_slot: 0,
             tip_median_lamports: 0,
             recent_outcomes: VecDeque::with_capacity(MAX_RECENT_OUTCOMES),
             active_bundle_count: 0,
+            total_retries: 0,
+            total_retries_succeeded: 0,
+            total_retries_exhausted: 0,
+            started_at,
         }
     }
 
@@ -39,6 +52,7 @@ impl OperationalState {
         info!(
             bundle_id = %outcome.bundle_id,
             stage = %outcome.stage,
+            retry_attempt = outcome.retry_attempt,
             "Operational state recording outcome"
         );
         if self.recent_outcomes.len() >= MAX_RECENT_OUTCOMES {
@@ -53,5 +67,25 @@ impl OperationalState {
 
     pub fn bundle_resolved(&mut self) {
         self.active_bundle_count = self.active_bundle_count.saturating_sub(1);
+    }
+
+    pub fn record_retry(&mut self) {
+        self.total_retries += 1;
+    }
+
+    pub fn record_retry_success(&mut self) {
+        self.total_retries_succeeded += 1;
+    }
+
+    pub fn record_retry_exhausted(&mut self) {
+        self.total_retries_exhausted += 1;
+    }
+
+    pub fn uptime_seconds(&self) -> u64 {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        now.saturating_sub(self.started_at)
     }
 }

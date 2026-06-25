@@ -1,6 +1,6 @@
 use tokio::sync::mpsc;
 
-/// Commitment status mirroring Yellowstone's three levels
+// Commitment status mirroring Yellowstone's three levels
 #[derive(Debug, Clone)]
 pub enum SlotStatus {
     Processed,
@@ -8,7 +8,6 @@ pub enum SlotStatus {
     Finalized,
     Unknown,
 }
-
 impl SlotStatus {
     pub fn from_u32(value: u32) -> Self {
         match value {
@@ -20,26 +19,39 @@ impl SlotStatus {
     }
 }
 
-/// All observable network events emitted by L1
+// Observable network events emitted by L1
 #[derive(Debug, Clone)]
 pub enum NetworkEvent {
-    /// A slot update with its commitment status
+    // Slot update with its commitment status
     SlotUpdate { slot: u64, status: SlotStatus },
-    /// Upcoming leader window for the next N slots
+    // Upcoming leader window for the next N slots
     LeaderWindow { slot: u64, leader: String },
-    /// Stub — block data observed (not yet implemented)
-    BlockObserved { slot: u64 },
-    /// Stub — transaction observed (not yet implemented)
-    TransactionObserved { signature: String },
 }
 
-/// Type alias for the event sender
 pub type EventSender = mpsc::Sender<NetworkEvent>;
-
-/// Type alias for the event receiver
 pub type EventReceiver = mpsc::Receiver<NetworkEvent>;
 
-/// Creates the event channel for L1 → L2 communication
+// Creates the event channel for L1 and L2 communication
 pub fn create_event_channel(buffer: usize) -> (EventSender, EventReceiver) {
     mpsc::channel(buffer)
+}
+
+// Observation
+pub enum CongestionLevel {
+    High,
+    Medium,
+    Low,
+}
+pub struct Observation {
+    pub current_slot: u64,
+    pub current_leader: String,
+    pub target_leader: String,
+    pub target_leader_start_slot: u64,
+    pub target_leader_end_slot: u64,
+    pub slots_until_target_leader: u64,
+    pub median_tip_lamports: u64,
+    pub p90_tip_lamports: u64,
+    pub tps: u64,
+    pub congestion_level: CongestionLevel,
+    pub timestamp: Option<u64>,
 }

@@ -32,15 +32,40 @@ impl BundleSubmitter {
         }
     }
 
-    pub async fn submit(&self, slot: u64, leader: String) -> Result<SubmissionRecord> {
+    pub async fn submit_with_options(
+        &self,
+        slot: u64,
+        leader: String,
+        tip_override: Option<u64>,
+        refresh_blockhash: bool,
+    ) -> Result<SubmissionRecord> {
         // Fetch blockhash (real or injected)
-        let blockhash = self.blockhash_fetcher.fetch()?;
+        let blockhash = if refresh_blockhash {
+            self.blockhash_fetcher.fetch_fresh()
+        } else {
+            self.blockhash_fetcher.fetch()
+        }?;
 
         // Calculate tip from live data
-        let tip_lamports = self.tip_calculator.calculate()?;
+        let tip_lamports = if let Some(override_tip) = tip_override {
+            let clamped = override_tip.clamp(1_000, 100_000);
+            if clamped != override_tip {
+                info!(
+                    override_tip,
+                    clamped, "Tip override clamped to safe production bounds"
+                );
+            }
+            clamped
+        } else {
+            self.tip_calculator.calculate().await?
+        };
 
         // Build bundle transactions
         let transactions = self.bundle_constructor.build(blockhash, tip_lamports)?;
+        let transaction_signatures = transactions
+            .iter()
+            .flat_map(|tx| tx.signatures.iter().map(|signature| signature.to_string()))
+            .collect::<Vec<_>>();
 
         // Serialize transactions to base64
         let encoded_txns: Vec<String> = transactions
@@ -69,6 +94,15 @@ impl BundleSubmitter {
             }
         };
 
+        println!("========== Submission Log: Starts ==========");
+        println!("Bundle ID: {}", bundle_id);
+        println!("Slot: {}", slot);
+        println!("Leader: {}", leader);
+        println!("Tip: {}", tip_lamports);
+        println!("Blockhash: {}", blockhash);
+        println!("Transaction Signatures: {:?}", transaction_signatures);
+        println!("========== Submission Log: Ends ==========");
+
         // Produce submission record for L4
         Ok(SubmissionRecord::new(
             bundle_id,
@@ -76,6 +110,7 @@ impl BundleSubmitter {
             leader,
             tip_lamports,
             blockhash.to_string(),
+            transaction_signatures,
         ))
     }
 }

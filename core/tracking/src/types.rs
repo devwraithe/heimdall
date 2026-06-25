@@ -1,3 +1,5 @@
+use std::sync::{Arc, atomic::AtomicBool};
+
 /// Classifies why a bundle failed.
 /// Used by L4 to categorise outcomes and
 /// by L6's AI agent to reason about retries.
@@ -15,6 +17,67 @@ pub enum FailureReason {
     BundleFailure,
     /// Unclassified failure — raw message preserved for debugging.
     Unknown(String),
+}
+
+impl FailureReason {
+    /// Machine-readable failure type string for log serialization.
+    pub fn failure_type(&self) -> &str {
+        match self {
+            Self::ExpiredBlockhash => "expired_blockhash",
+            Self::FeeTooLow => "fee_too_low",
+            Self::ComputeExceeded => "compute_exceeded",
+            Self::BundleFailure => "bundle_failure",
+            Self::Unknown(_) => "unknown",
+        }
+    }
+
+    /// Human-readable recovery guidance.
+    pub fn recovery_guidance(&self) -> &str {
+        match self {
+            Self::ExpiredBlockhash => {
+                "Fetch a fresh blockhash via getLatestBlockhash at confirmed commitment and resubmit. The original blockhash exceeded the 150-slot validity window."
+            }
+            Self::FeeTooLow => {
+                "Recalculate the tip using the Jito tip floor API (landed_tips_75th_percentile) and resubmit with a higher tip amount."
+            }
+            Self::ComputeExceeded => {
+                "Reduce transaction compute usage or request a higher compute budget. Retry may succeed if network load has decreased."
+            }
+            Self::BundleFailure => {
+                "Bundle was rejected by Jito. Check that the bundle contains valid transactions with correct signatures. Rebuild and resubmit."
+            }
+            Self::Unknown(_) => {
+                "Unclassified failure. Inspect the raw Jito response for details. Retry with a fresh blockhash and recalculated tip."
+            }
+        }
+    }
+}
+
+/// Classifies where in the pipeline a failure occurred.
+#[derive(Debug, Clone, PartialEq)]
+pub enum FailureStage {
+    /// Failure during tip calculation or blockhash fetch
+    PreSubmission,
+    /// Failure during Jito submission (HTTP error, rate limit)
+    Submission,
+    /// Failure detected by Jito (bundle rejected, execution error)
+    Execution,
+    /// Failure detected during confirmation tracking (timeout, not landed)
+    Confirmation,
+    /// Failure detected by Yellowstone transaction stream
+    YellowstoneStream,
+}
+
+impl FailureStage {
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::PreSubmission => "pre_submission",
+            Self::Submission => "submission",
+            Self::Execution => "execution",
+            Self::Confirmation => "confirmation",
+            Self::YellowstoneStream => "yellowstone_stream",
+        }
+    }
 }
 
 /// Represents a bundle's current position
@@ -48,8 +111,12 @@ pub struct BundleOutcome {
     pub tip_lamports: u64,
     /// Blockhash used at bundle construction
     pub blockhash: String,
+    /// Transaction signatures contained in the bundle
+    pub transaction_signatures: Vec<String>,
     /// Current commitment stage
     pub stage: CommitmentStage,
+    /// Source of the first processed confirmation
+    pub confirmation_source: String,
     /// Unix timestamp of submission
     pub submitted_at: u64,
     /// Unix timestamp when bundle was processed
@@ -65,21 +132,26 @@ pub struct BundleOutcome {
     /// Slot number at finalized stage
     pub finalized_slot: Option<u64>,
     /// The latest finalized slot when this bundle was registered.
-    /// Used to ignore stale confirmations from before registration.
     pub registered_at_slot: u64,
+    /// If this is a retry, the original bundle ID
+    pub original_bundle_id: Option<String>,
+    /// Retry attempt number (0 = first submission)
+    pub retry_attempt: u32,
+    pub already_resolved: Arc<AtomicBool>,
 }
 impl BundleOutcome {
-    /// Creates a fresh BundleOutcome from a SubmissionRecord.
-    /// All commitment stage fields start as None —
-    /// populated by L4 as the bundle progresses.
     pub fn new(
         bundle_id: String,
         slot: u64,
         leader: String,
         tip_lamports: u64,
         blockhash: String,
+        transaction_signatures: Vec<String>,
         submitted_at: u64,
         registered_at_slot: u64,
+        original_bundle_id: Option<String>,
+        retry_attempt: u32,
+        already_resolved: Arc<AtomicBool>,
     ) -> Self {
         Self {
             bundle_id,
@@ -87,7 +159,9 @@ impl BundleOutcome {
             leader,
             tip_lamports,
             blockhash,
+            transaction_signatures,
             stage: CommitmentStage::Submitted,
+            confirmation_source: "pending".to_string(),
             submitted_at,
             processed_at: None,
             confirmed_at: None,
@@ -96,6 +170,9 @@ impl BundleOutcome {
             confirmed_slot: None,
             finalized_slot: None,
             registered_at_slot,
+            original_bundle_id,
+            retry_attempt,
+            already_resolved,
         }
     }
 
@@ -107,14 +184,41 @@ impl BundleOutcome {
     }
 
     pub fn latency_confirmed(&self) -> Option<u64> {
-        self.processed_at
-            .map(|p| p.saturating_sub(self.submitted_at))
+        self.confirmed_at
+            .map(|c| c.saturating_sub(self.submitted_at))
     }
 
     pub fn latency_finalized(&self) -> Option<u64> {
         self.finalized_at
-            .zip(self.confirmed_at)
-            .map(|(f, c)| f.saturating_sub(c))
+            .map(|f| f.saturating_sub(self.submitted_at))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, atomic::AtomicBool};
+
+    use super::BundleOutcome;
+
+    #[test]
+    fn finalized_latency_is_measured_from_submission() {
+        let mut outcome = BundleOutcome::new(
+            "bundle-1".to_string(),
+            42,
+            "leader-1".to_string(),
+            1_000,
+            "blockhash-1".to_string(),
+            vec!["sig-1".to_string()],
+            100,
+            41,
+            None,
+            0,
+            Arc::new(AtomicBool::new(false)),
+        );
+
+        outcome.finalized_at = Some(115);
+
+        assert_eq!(outcome.latency_finalized(), Some(15));
     }
 }
 
@@ -127,6 +231,7 @@ pub struct LifecycleEntry {
     pub leader: String,
     pub tip_lamports: u64,
     pub blockhash: String,
+    pub confirmation_source: String,
     /// Commitment progression timestamps
     pub submitted_at: u64,
     pub processed_at: Option<u64>,
@@ -142,5 +247,11 @@ pub struct LifecycleEntry {
     pub latency_finalized_secs: Option<u64>,
     /// Outcome
     pub status: String,
+    /// Three-field failure classification
     pub failure_reason: Option<String>,
+    pub failure_stage: Option<String>,
+    pub recovery: Option<String>,
+    /// Retry lineage
+    pub original_bundle_id: Option<String>,
+    pub retry_attempt: u32,
 }

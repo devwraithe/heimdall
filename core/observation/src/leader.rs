@@ -5,8 +5,8 @@ use std::collections::HashMap;
 use tracing::info;
 
 pub struct LeaderSchedule {
-    /// Maps slot number to validator identity
-    schedule: HashMap<u64, String>,
+    // Maps slot number to validator identity
+    pub schedule: HashMap<u64, String>,
 }
 
 impl LeaderSchedule {
@@ -16,6 +16,7 @@ impl LeaderSchedule {
 
         info!(current_slot, "Fetching leader schedule");
 
+        // Get leader schedule via rpc
         let schedule_map = client
             .get_leader_schedule(Some(current_slot))?
             .ok_or_else(|| anyhow::anyhow!("Leader schedule not available"))?;
@@ -24,7 +25,7 @@ impl LeaderSchedule {
         let slots_per_epoch = 432_000u64;
         let epoch_start_slot = (current_slot / slots_per_epoch) * slots_per_epoch;
 
-        // Reverse map: slot_index and validator identity
+        // Reverse map using slot_index and validator identity
         let mut schedule = HashMap::new();
         for (validator, slot_indices) in schedule_map {
             for slot_index in slot_indices {
@@ -41,12 +42,7 @@ impl LeaderSchedule {
         Ok(Self { schedule })
     }
 
-    /// Returns the leader for a specific slot
-    pub fn _get_leader(&self, slot: u64) -> Option<&str> {
-        self.schedule.get(&slot).map(|s| s.as_str())
-    }
-
-    /// Returns leaders for the next N slots from current
+    // Returns leaders for the next N slots from current slot
     pub fn get_upcoming_leaders(&self, current_slot: u64, window: u64) -> Vec<(u64, &str)> {
         (current_slot..current_slot + window)
             .filter_map(|slot| {

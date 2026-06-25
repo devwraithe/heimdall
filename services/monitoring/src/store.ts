@@ -7,6 +7,9 @@ export interface AgentDecision {
   failureClassification: string;
   refreshBlockhash: boolean;
   suggestedTipLamports: number;
+  confidence: number;
+  observedRisk: string;
+  source: "local_rules" | "gemini" | "fallback";
 }
 
 export interface MetricsStore {
@@ -39,6 +42,7 @@ export function updateSnapshot(snapshot: OperationalSnapshot): void {
     if (seenOutcomeIds.has(outcome.bundleId)) continue;
     seenOutcomeIds.add(outcome.bundleId);
 
+    store.totalBundlesSubmitted++;
     if (outcome.stage === "Failed") {
       store.totalBundlesFailed++;
     } else if (outcome.stage === "Finalized") {
