@@ -1,4 +1,3 @@
-use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 pub type CandidateSender = mpsc::Sender<TransactionCandidate>;
 pub type CandidateReceiver = mpsc::Receiver<TransactionCandidate>;
@@ -46,8 +45,14 @@ pub struct SubmissionRecord {
     pub tip_lamports: u64,
     /// Blockhash used when constructing the bundle
     pub blockhash: String,
+    /// Signatures for the bundle transactions
+    pub transaction_signatures: Vec<String>,
     /// Unix timestamp of submission
     pub submitted_at: u64,
+    /// If this is a retry, the original bundle ID
+    pub original_bundle_id: Option<String>,
+    /// Retry attempt number (0 = first submission)
+    pub retry_attempt: u32,
 }
 
 impl SubmissionRecord {
@@ -57,6 +62,7 @@ impl SubmissionRecord {
         leader: String,
         tip_lamports: u64,
         blockhash: String,
+        transaction_signatures: Vec<String>,
     ) -> Self {
         let submitted_at = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -69,8 +75,17 @@ impl SubmissionRecord {
             leader,
             tip_lamports,
             blockhash,
+            transaction_signatures,
             submitted_at,
+            original_bundle_id: None,
+            retry_attempt: 0,
         }
+    }
+
+    pub fn as_retry(mut self, original_bundle_id: String, attempt: u32) -> Self {
+        self.original_bundle_id = Some(original_bundle_id);
+        self.retry_attempt = attempt;
+        self
     }
 }
 
@@ -90,6 +105,8 @@ pub struct SlotConfirmation {
     pub slot: u64,
     /// Raw commitment level: 0=Processed, 1=Confirmed, 2=Finalized
     pub commitment: u32,
+    /// Optional transaction signature observed through Yellowstone
+    pub signature: Option<String>,
 }
 
 pub type ConfirmationSender = mpsc::Sender<SlotConfirmation>;
@@ -115,18 +132,31 @@ pub fn create_tip_channel(buffer: usize) -> (TipSender, TipReceiver) {
 /// Shared infrastructure configuration
 pub struct InfraConfig {
     pub jito_url: String,
+    pub rpc_url: String,
 }
 
 /// Plain data struct representing a bundle outcome.
 /// Lives in shared so all crates can reference it
 /// without depending on protobuf-generated types.
+///
+/// Uses three-field failure classification:
+/// - `failure_reason`: machine-readable category (ExpiredBlockhash, FeeTooLow, etc.)
+/// - `failure_stage`: where the failure occurred (pre_submission, submission, execution, confirmation)
+/// - `recovery`: human-readable recovery guidance
 #[derive(Debug, Clone)]
 pub struct BundleOutcomeSummary {
     pub bundle_id: String,
     pub slot: u64,
     pub stage: String,
     pub failure_reason: String,
+    pub failure_stage: String,
+    pub recovery: String,
     pub tip_lamports: u64,
     pub blockhash: String,
     pub submitted_at: u64,
+    /// Retry lineage: original bundle ID if this is a retry
+    pub original_bundle_id: String,
+    /// Retry attempt number (0 = first submission)
+    pub retry_attempt: u32,
 }
+

@@ -2,10 +2,23 @@
 
 A smart Solana transaction infrastructure stack that observes the network in
 real time, submits transactions intelligently via Jito bundles, tracks outcomes
-across commitment levels, and uses an AI agent to autonomously detect failures
-and decide retry strategies.
+across commitment levels, and uses a two-tier AI agent to autonomously detect
+failures and decide retry strategies with exponential backoff.
 
 Built for the Superteam Earn bounty: **Smart Transaction Infrastructure Stack**.
+
+---
+
+## Project Resources
+
+| Resource | URL |
+|---|---|
+| Documentation Site | [heimdall-docs.vercel.app](https://heimdall-docs.vercel.app) *(deploy with `cd docs && npm run build`)* |
+| Architecture Document | [ARCHITECTURE.md](./ARCHITECTURE.md) |
+| Operational Evidence Report | [EVIDENCE.md](./EVIDENCE.md) |
+| Live Monitoring (when running) | `http://localhost:3000` |
+| Evidence Export (when running) | `GET http://localhost:3000/evidence` |
+| SSE Real-Time Stream (when running) | `GET http://localhost:3000/events` |
 
 ---
 
@@ -18,30 +31,36 @@ Heimdall is a 7-layer transaction infrastructure stack split across two runtimes
 - **Services (TypeScript/Bun)** — L6 and L7: AI decision agent and monitoring
 
 ```
-L1 — Network Observation      Yellowstone gRPC slot stream + leader schedule
-L2 — Transaction Intelligence  Candidate deduplication and channel to L3
-L3 — Transaction Submission   Jito bundle construction, dynamic tips, fault injection
-L4 — Confirmation Tracking    Lifecycle tracking, getBundleStatuses polling
-L5 — Operational State Engine gRPC server streaming snapshots to L6
-L6 — AI Decision Layer        Gemini agent reasoning about failures and retries
-L7 — Monitoring & Control     HTTP endpoints exposing live metrics
+L1 — Network Observation      Yellowstone gRPC slot stream + transaction signature watcher
+L2 — Transaction Intelligence Candidate deduplication and channel to L3
+L3 — Transaction Submission   Jito bundle construction, dynamic tips, exponential backoff retry
+L4 — Confirmation Tracking    Lifecycle tracking, three-field failure classification
+L5 — Operational State Engine gRPC server streaming snapshots to L6/L7
+L6 — AI Decision Layer        Two-tier pipeline: Local Rules → Gemini LLM (with fallback)
+L7 — Monitoring & Control     HTTP API + SSE stream + evidence export
 ```
 
 ---
 
 ## Architecture
 
-Full C4 architecture diagrams (Context, Container, Component) are available in
-the public architecture document.
+Full C4 architecture diagrams (Context, Container, Component), channel topology,
+failure handling strategy, and infrastructure decisions are available in
+[ARCHITECTURE.md](./ARCHITECTURE.md).
+
+> **Bounty requirement**: Publish `ARCHITECTURE.md` to a public Notion page,
+> Google Doc, or Figma URL and link it here before submission.
 
 **Inter-layer communication:**
 
 - L1 → L2: `tokio::sync::mpsc` channel carrying `NetworkEvent`
 - L2 → L3: `tokio::sync::mpsc` channel carrying `TransactionCandidate`
 - L3 → L4: `tokio::sync::mpsc` channel carrying `SubmissionRecord`
-- L1 → L4: `tokio::sync::mpsc` channel carrying `SlotConfirmation`
+- L1 → L4: `tokio::sync::mpsc` channel carrying `SlotConfirmation` (slot + optional signature)
 - L5 → L6: gRPC server-side streaming (`OperationalSnapshot` every 500ms)
 - L5 → L7: gRPC server-side streaming (same subscription)
+- L6 → L5: gRPC unary RPC (`RetryRequest` → `RetryResponse`)
+- L6 → L7: HTTP POST `/decisions` (agent decision recording)
 
 ---
 
@@ -68,30 +87,11 @@ cd heimdall
 
 ### 2. Configure environment variables
 
-Create a `.env` file at the project root:
+Copy `.env.example` to `.env` at the project root and fill in the real values.
+All services read the root `.env`; there is no separate `services/.env` file.
 
-```env
-# SolInfra Yellowstone gRPC
-GRPC_ENDPOINT=https://fra.grpc.solinfra.dev:443
-GRPC_X_TOKEN=your_solinfra_api_key
-
-# SolInfra RPC
-RPC_ENDPOINT=https://fra.rpc.solinfra.dev/sol?api_key=your_solinfra_api_key
-
-# Jito block engine
-JITO_URL=https://mainnet.block-engine.jito.wtf/api/v1
-
-# Solana keypair
-KEYPAIR_PATH=/path/to/your/solana/keypair.json
-
-# Google Gemini
-GEMINI_API_KEY=your_gemini_api_key
-```
-
-Create a `.env` file in `services/`:
-
-```env
-GEMINI_API_KEY=your_gemini_api_key
+```bash
+cp .env.example .env
 ```
 
 ### 3. Generate or use an existing Solana keypair
@@ -125,9 +125,9 @@ bun install
 
 ## Running Heimdall
 
-Heimdall runs as three separate processes. Open three terminals.
+### Option A: Three separate terminals
 
-### Terminal 1 — Rust core (L1–L5)
+#### Terminal 1 — Rust core (L1–L5)
 
 ```bash
 cd core
@@ -145,7 +145,7 @@ INFO intelligence::consumer: Intelligence engine running...
 INFO tracking::tracker: Outcome tracker running...
 ```
 
-### Terminal 2 — AI agent (L6)
+#### Terminal 2 — AI agent (L6)
 
 ```bash
 cd services/agent
@@ -156,12 +156,13 @@ Expected output:
 
 ```
 Heimdall L6 AI Agent starting...
+Two-tier pipeline: Local Rules → Gemini LLM (with fallback)
 Connecting to L5 at localhost:50051
 Stream created, waiting for data...
 Snapshot received: slot=... tip=...
 ```
 
-### Terminal 3 — Monitoring (L7)
+#### Terminal 3 — Monitoring (L7)
 
 ```bash
 cd services/monitoring
@@ -174,6 +175,42 @@ Expected output:
 Heimdall L7 Monitoring running on http://localhost:3000
 L7 connected to L5 state stream
 ```
+
+### Option B: Docker Compose
+
+```bash
+docker compose up --build
+```
+
+This starts all three services with a shared volume for lifecycle data.
+The monitoring API is available at `http://localhost:3000`.
+
+### Option C: CLI Tool
+
+Heimdall includes a CLI for operational control:
+
+```bash
+# Live TUI monitoring terminal
+bun run cli/heimdall.ts monitor
+
+# Quick status check
+bun run cli/heimdall.ts status
+
+# Download evidence report
+bun run cli/heimdall.ts evidence
+
+# Check all service health
+bun run cli/heimdall.ts health
+
+# Launch all services
+bun run cli/heimdall.ts start
+```
+
+The `monitor` command provides a live TUI dashboard with:
+- Real-time slot pulse and network status
+- Bundle outcomes table with stage, failure type, and retry lineage
+- AI agent decision history with confidence bars and risk assessment
+- Retry metrics (total retries, succeeded, exhausted)
 
 ---
 
@@ -188,11 +225,17 @@ curl http://localhost:3000/health
 # Live network metrics
 curl http://localhost:3000/metrics
 
-# Recent bundle outcomes
+# Recent bundle outcomes (with three-field failure classification)
 curl http://localhost:3000/outcomes
 
-# Recent AI agent decisions
+# Recent AI agent decisions (with confidence and risk)
 curl http://localhost:3000/decisions
+
+# SSE real-time stream (connect via EventSource)
+curl http://localhost:3000/events
+
+# Download judge-ready evidence report (Markdown)
+curl -o evidence.md http://localhost:3000/evidence
 ```
 
 Sample `/metrics` response:
@@ -203,8 +246,12 @@ Sample `/metrics` response:
   "latest_finalized_slot": 428014988,
   "tip_median_lamports": 1065803,
   "active_bundle_count": 0,
+  "total_bundles_submitted": 12,
   "total_bundles_failed": 2,
-  "total_bundles_finalized": 0,
+  "total_bundles_finalized": 10,
+  "total_retries": 3,
+  "retries_succeeded": 2,
+  "retries_exhausted": 1,
   "uptime_seconds": 42
 }
 ```
@@ -213,32 +260,30 @@ Sample `/metrics` response:
 
 ## Fault Injection
 
-To trigger the autonomous retry demonstration, switch `BlockhashMode` in
-`core/observation/src/main.rs`:
+To trigger the autonomous retry demonstration, set `BLOCKHASH_MODE=fault_injected`
+in `.env` or export it in the shell before starting Heimdall.
 
-```rust
-// Inject an expired blockhash to trigger AI agent retry decision
-let submitter = BundleSubmitter::new(
-    &rpc_url,
-    &jito_url_for_l3,
-    keypair,
-    BlockhashMode::FaultInjected, // ← change this
-);
-```
-
-The AI agent will detect the failure via `getBundleStatuses`, classify it as
-`ExpiredBlockhash`, and output a structured retry decision:
+The AI agent will detect the failure via `getBundleStatuses`, classify it using
+three-field decomposition, and output a structured retry decision:
 
 ```
-=== AGENT RETRY DECISION ===
-Reason: All bundles failed due to ExpiredBlockhash...
-Failure: ExpiredBlockhash
+=== AGENT DECISION (GEMINI) ===
+Action: RETRY
+Reason: 2 bundles failed due to expired blockhash...
+Failure: expired_blockhash
 Refresh blockhash: true
-Suggested tip: 2465543 lamports
-============================
+Suggested tip: 1,969,705 lamports
+Confidence: 90%
+Risk: Blockhash expiry indicates the bundle exceeded the 150-slot validity window.
+Source: gemini
+==========================================
 ```
 
-Reset to `BlockhashMode::Normal` after demonstration.
+The retry flows through L5 to L3, which applies exponential backoff (2s, 4s,
+8s, 16s) for up to 4 attempts. Each retry fetches a fresh blockhash (bypassing
+fault injection) and uses the agent's suggested tip.
+
+Reset to `BLOCKHASH_MODE=normal` after demonstration.
 
 ---
 
@@ -250,14 +295,17 @@ JSON (NDJSON). Each entry contains:
 - Bundle ID, target slot, leader identity
 - Tip amount in lamports
 - Blockhash used at construction
+- Confirmation source (`yellowstone_stream` or `slot_heuristic`)
 - Submission, processed, confirmed, and finalized timestamps
 - Commitment progression slot numbers
 - Latency deltas between stages in seconds
-- Final status and failure classification
+- Final status
+- Three-field failure classification:
+  - `failure_reason` — machine-readable category
+  - `failure_stage` — pipeline stage where failure occurred
+  - `recovery` — human-readable recovery guidance
 
-The curated submission log is at `core/final_lifecycle.log` — 10 real
-mainnet bundle submissions plus 2 ExpiredBlockhash failure cases. All slot
-numbers are verifiable at `explorer.jito.wtf`.
+The curated submission log is at `core/final_lifecycle.log`.
 
 ---
 
@@ -342,8 +390,9 @@ at execution time. A skipped slot means the bundle was never attempted at all.
 The correct response is to detect the empty `getBundleStatuses` result, fetch a
 fresh blockhash (the original may still be valid), recalculate the tip based on
 current conditions for the new leader, and resubmit. This is precisely what
-Heimdall's autonomous retry agent does — it classifies the failure and decides
-the retry parameters without hardcoded logic.
+Heimdall's autonomous retry agent does — the two-tier pipeline classifies the
+failure, decides the retry parameters with a confidence score, and L3 resubmits
+with exponential backoff (up to 4 attempts).
 
 In practice, Jito leaders skip slots at a low but non-zero rate. Production
 systems must treat every bundle submission as potentially needing a retry and
@@ -357,19 +406,59 @@ build the retry path as a first-class concern, not an afterthought.
 heimdall/
 ├── core/                          # Rust workspace (L1–L5)
 │   ├── observation/               # L1 — Network Observation
+│   │   └── src/
+│   │       ├── main.rs            # Entry point, Yellowstone stream, signature watcher
+│   │       └── leader.rs          # Leader schedule fetcher
 │   ├── intelligence/              # L2 — Transaction Intelligence
+│   │   └── src/consumer.rs        # Candidate deduplication
 │   ├── submission/                # L3 — Transaction Submission
+│   │   └── src/
+│   │       ├── submitter.rs       # Bundle submitter with retry support
+│   │       ├── blockhash.rs       # Normal / FaultInjected / FetchFresh modes
+│   │       ├── tip.rs             # Jito API + balance fallback tip calculator
+│   │       └── bundle.rs          # Payload + tip transaction construction
 │   ├── tracking/                  # L4 — Confirmation Tracking
+│   │   └── src/
+│   │       ├── tracker.rs         # Outcome tracker with three-field classification
+│   │       ├── types.rs           # BundleOutcome, FailureReason, FailureStage
+│   │       └── lifecycle_log.rs   # NDJSON log writer
 │   ├── state/                     # L5 — Operational State Engine
-│   └── shared/                    # Shared types across crates
+│   │   └── src/
+│   │       ├── server.rs          # gRPC Subscribe + Retry + Health RPC
+│   │       └── engine.rs          # OperationalState → OperationalSnapshot mapper
+│   ├── shared/                    # Shared types across crates
+│   │   └── src/
+│   │       ├── types.rs           # SubmissionRecord, BundleOutcomeSummary, channels
+│   │       └── engine.rs          # OperationalState struct + retry metrics
+│   └── Dockerfile                 # Multi-stage Rust build
 ├── services/                      # TypeScript workspace (L6–L7)
 │   ├── agent/                     # L6 — AI Decision Layer
+│   │   ├── Dockerfile
+│   │   └── src/
+│   │       ├── agent.ts           # Two-tier pipeline: local rules + Gemini + escalation
+│   │       ├── agent.test.ts      # 6 unit tests for rules engine
+│   │       ├── client.ts          # gRPC client + L7 decision push
+│   │       ├── index.ts           # Main loop with rate limiting
+│   │       └── types.ts           # TypeScript interfaces
 │   └── monitoring/                # L7 — Monitoring & Control
+│       ├── Dockerfile
+│       └── src/
+│           ├── index.ts           # HTTP + SSE + evidence export
+│           ├── client.ts          # gRPC client to L5
+│           ├── store.ts           # Metrics store + retry tracking
+│           └── types.ts           # TypeScript interfaces
+├── cli/                           # CLI Tool
+│   ├── heimdall.ts                # CLI with TUI monitor, status, evidence, health
+│   └── package.json
+├── scripts/
+│   └── smoke-test.sh              # End-to-end pipeline validation
 ├── proto/
-│   └── heimdall.proto             # gRPC service definition
-├── docs/                          # Architecture diagrams
-├── core/final_lifecycle.log       # Curated submission lifecycle log
-└── .env                           # Environment configuration
+│   └── heimdall.proto             # gRPC service definition (Subscribe + Retry + Health)
+├── ARCHITECTURE.md                # Architecture document (publish externally)
+├── EVIDENCE.md                    # Operational evidence report
+├── docker-compose.yml             # 3-service orchestration
+├── .env.example                   # Environment variable template
+└── core/final_lifecycle.log       # Curated submission lifecycle log
 ```
 
 ---
@@ -381,24 +470,42 @@ L5 exposes an `OperationalStateService` via tonic/gRPC. L6 and L7 subscribe
 as clients. This gives typed, streaming, language-agnostic communication
 across the runtime boundary without polling overhead.
 
+**Two-tier AI reasoning pipeline**
+A deterministic local rules engine runs first, producing a decision with
+confidence score and risk assessment. Gemini LLM then refines the decision
+with independent reasoning against hard constraints. If Gemini is unreachable,
+the local rules decision is used as a fallback. This ensures the system never
+depends on a single external API for operational decisions.
+
 **Dynamic tip calculation**
-Tips are never hardcoded. L3 samples all 8 Jito tip accounts via RPC, takes
-the median balance, and applies a 10% premium. This positions each bundle
-competitively without overpaying.
+Tips are never hardcoded. L3 queries the Jito recommended tip API first and
+falls back to live tip-account balances if that API is unavailable. A floor
+(1,000 lamports) and cap (100,000 lamports) keep the value in a sane range.
 
-**Fault injection via `BlockhashMode`**
-A single enum controls whether L3 fetches a real blockhash or returns
-`Hash::default()` (all zeros). This makes fault injection a first-class
-feature — toggling it on/off requires one line change and does not affect
-any other part of the stack.
+**Exponential backoff retry**
+Retry attempts use exponential backoff (2s, 4s, 8s, 16s) with a maximum of
+4 attempts per bundle. Each retry fetches a fresh blockhash (bypassing fault
+injection) and uses the agent's suggested tip. After max attempts, the bundle
+is dropped and the failure is logged.
 
-**No hardcoded retry logic**
-The AI agent owns all retry decisions. L4 detects failure, L5 aggregates
-it, L6 reasons about it. The agent prompt gives Gemini network conditions,
-failure data, and tip information — it returns structured JSON with
-`shouldRetry`, `refreshBlockhash`, `suggestedTipLamports`, and
-`failureClassification`. Sequential automation without reasoning does not
-qualify as an AI agent.
+**Three-field failure classification**
+Every failure is decomposed into `failure_reason` (machine-readable category),
+`failure_stage` (pipeline location), and `recovery` (human-readable guidance).
+This matches production-grade failure semantics and gives judges full
+transparency into failure handling.
+
+**Fault injection via `BLOCKHASH_MODE`**
+An environment variable controls whether L3 fetches a real blockhash or
+returns `Hash::default()` (all zeros). This makes fault injection a
+first-class feature without source changes. The retry path's `fetch_fresh()`
+bypasses this mode, ensuring retries produce a different outcome.
+
+**Yellowstone signature confirmation**
+After each bundle submission, L1 spawns a dedicated Yellowstone gRPC
+transaction subscription filtered by the bundle's signatures. This provides
+sub-second confirmation without relying solely on slot-range heuristics.
+The heuristic remains as a fallback; the `confirmation_source` field tracks
+which path confirmed each bundle.
 
 ---
 
@@ -408,6 +515,109 @@ qualify as an AI agent.
 - **gRPC provider:** SolInfra Yellowstone (`fra.grpc.solinfra.dev:443`)
 - **RPC provider:** SolInfra (`fra.rpc.solinfra.dev`)
 - **Bundle submission:** Jito block engine (`mainnet.block-engine.jito.wtf`)
-- **AI model:** Google Gemini `gemini-1.5-flash`
+- **Dynamic tips:** Jito tip floor API (`bundles.jito.wtf`)
+- **AI model:** Google Gemini `gemini-2.5-flash` (with local rules fallback)
 - **L5 gRPC port:** 50051
 - **L7 HTTP port:** 3000
+
+---
+
+## Verification Guide
+
+### For Judges
+
+1. **Verify bundle IDs on Jito Explorer**: Copy any `bundle_id` from
+   `core/final_lifecycle.log` and search at [explorer.jito.wtf](https://explorer.jito.wtf/)
+2. **Verify slots on Solana Explorer**: Copy any `slot` number and search at
+   [explorer.solana.com](https://explorer.solana.com/)
+3. **Inspect lifecycle log**: Open `core/final_lifecycle.log` — each line is
+   NDJSON with full commitment-stage progression, three-field failure
+   classification, and retry lineage
+4. **Check retry lineage**: Look for entries with `retry_attempt > 0` and their
+   `original_bundle_id` pointing back to the first submission
+5. **Run the smoke test**: `bash scripts/smoke-test.sh` (requires L7 running)
+6. **Download evidence**: `curl http://localhost:3000/evidence` for a formatted
+   Markdown report
+7. **Use the TUI**: `bun run cli/heimdall.ts monitor` for a live terminal
+   dashboard
+
+### What to look for in the logs
+
+| Field | Where to find it | What it tells you |
+|---|---|---|
+| `bundle_id` | lifecycle.log | Unique Jito bundle identifier, verifiable on Jito Explorer |
+| `slot` | lifecycle.log | Target slot, verifiable on Solana Explorer |
+| `tip_lamports` | lifecycle.log | Real tip paid, demonstrates dynamic tip calculation |
+| `latency_processed_secs` | lifecycle.log | Time from submission to processed confirmation |
+| `confirmation_source` | lifecycle.log | Whether confirmed via Yellowstone stream or slot heuristic |
+| `failure_reason` | lifecycle.log | Machine-readable failure category |
+| `failure_stage` | lifecycle.log | Where in the pipeline the failure occurred |
+| `recovery` | lifecycle.log | Human-readable recovery guidance |
+| `original_bundle_id` | lifecycle.log | Links a retry to its original submission |
+| `retry_attempt` | lifecycle.log | Which retry attempt this was (0 = original) |
+
+---
+
+## Running Tests
+
+### Rust tests (6 tests)
+
+```bash
+cd core && cargo test
+```
+
+Tests cover: tip calculation, failure classification, lifecycle latency, bundle
+status parsing.
+
+### TypeScript tests (6 tests)
+
+```bash
+cd services/agent && bun test
+```
+
+Tests cover: local rules engine (no failures, expired blockhash, fee too low,
+non-recoverable failures, critical failure rate, hold mode escalation).
+
+### Smoke test (end-to-end)
+
+```bash
+# Start all services first, then:
+bash scripts/smoke-test.sh
+```
+
+Validates: health endpoint, metrics, outcomes, decisions, SSE stream, evidence
+export, decision POST.
+
+---
+
+## Runbook
+
+### Launch sequence
+
+1. Start the Rust core: `cd core && cargo run`
+2. Wait for "L5 gRPC server starting port=50051"
+3. Start the agent: `cd services/agent && bun run src/index.ts`
+4. Wait for "Stream created, waiting for data..."
+5. Start monitoring: `cd services/monitoring && bun run src/index.ts`
+6. Wait for "L7 Monitoring running on http://localhost:3000"
+
+Or use `bun run cli/heimdall.ts start` to launch all three at once.
+
+### Generating fresh evidence
+
+1. Set `BLOCKHASH_MODE=normal` in `.env`
+2. Start all services and let 10 bundles finalize
+3. Stop the core, set `BLOCKHASH_MODE=fault_injected`
+4. Restart core and let 2 bundles fail (these trigger the retry pipeline)
+5. Copy `core/lifecycle.log` to `core/final_lifecycle.log`
+6. Download the evidence report: `curl -o evidence.md http://localhost:3000/evidence`
+
+### Troubleshooting
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| "ECONNREFUSED 127.0.0.1:50051" | Rust core not running | Start core first |
+| "Rate limited" in agent output | Gemini API rate limit | Wait 30s, agent auto-recovers |
+| "Max retry attempts reached" | Bundle exhausted all 4 retries | Check failure type in logs |
+| "HOLD MODE active" | 3+ consecutive retry failures | Wait 60s for cooldown |
+| "Non-recoverable" in decisions | compute_exceeded or program_error | Fix the transaction payload |

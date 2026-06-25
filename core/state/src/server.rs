@@ -3,6 +3,7 @@ use crate::heimdall::{
     OperationalSnapshot, SubscribeRequest,
     operational_state_service_server::OperationalStateService,
 };
+use crate::heimdall::{HealthRequest, HealthResponse, RetryRequest, RetryResponse};
 use shared::engine::OperationalState;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -16,11 +17,12 @@ const SNAPSHOT_INTERVAL_MS: u64 = 500;
 
 pub struct StateServer {
     state: Arc<Mutex<OperationalState>>,
+    retry_tx: mpsc::Sender<RetryRequest>,
 }
 
 impl StateServer {
-    pub fn new(state: Arc<Mutex<OperationalState>>) -> Self {
-        Self { state }
+    pub fn new(state: Arc<Mutex<OperationalState>>, retry_tx: mpsc::Sender<RetryRequest>) -> Self {
+        Self { state, retry_tx }
     }
 }
 
@@ -60,5 +62,44 @@ impl OperationalStateService for StateServer {
         });
 
         Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
+    }
+
+    async fn retry(
+        &self,
+        request: Request<RetryRequest>,
+    ) -> Result<Response<RetryResponse>, Status> {
+        let retry = request.into_inner();
+
+        info!(
+            confidence = retry.confidence,
+            risk = %retry.observed_risk,
+            classification = %retry.failure_classification,
+            "Retry request received via gRPC"
+        );
+
+        if self.retry_tx.send(retry).await.is_err() {
+            return Err(Status::internal("Failed to queue retry request"));
+        }
+
+        Ok(Response::new(RetryResponse {
+            accepted: true,
+            message: "Retry accepted".into(),
+        }))
+    }
+
+    async fn health(
+        &self,
+        _request: Request<HealthRequest>,
+    ) -> Result<Response<HealthResponse>, Status> {
+        let (healthy, uptime, slot) = match self.state.lock() {
+            Ok(s) => (true, s.uptime_seconds(), s.current_slot),
+            Err(_) => (false, 0, 0),
+        };
+
+        Ok(Response::new(HealthResponse {
+            healthy,
+            uptime_seconds: uptime,
+            current_slot: slot,
+        }))
     }
 }

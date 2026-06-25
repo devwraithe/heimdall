@@ -1,0 +1,44 @@
+version: "3.9"
+
+services:
+  core:
+    build:
+      context: .
+      dockerfile: core/Dockerfile
+    env_file: .env
+    ports:
+      - "50051:50051"
+    volumes:
+      - heimdall-data:/app/shared
+    environment:
+      - LIFECYCLE_LOG_PATH=/app/shared/lifecycle.log
+    restart: unless-stopped
+
+  agent:
+    build:
+      context: .
+      dockerfile: services/agent/Dockerfile
+    env_file: .env
+    environment:
+      - L5_ADDRESS=core:50051
+      - L7_ADDRESS=http://monitoring:3000
+    depends_on:
+      - core
+      - monitoring
+    restart: unless-stopped
+
+  monitoring:
+    build:
+      context: .
+      dockerfile: services/monitoring/Dockerfile
+    env_file: .env
+    environment:
+      - L5_ADDRESS=core:50051
+    ports:
+      - "3000:3000"
+    depends_on:
+      - core
+    restart: unless-stopped
+
+volumes:
+  heimdall-data:
