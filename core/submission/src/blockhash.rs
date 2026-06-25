@@ -30,22 +30,29 @@ impl BlockhashFetcher {
         }
     }
 
+    fn fetch_real(&self) -> Result<Hash> {
+        let blockhash = self.rpc_client.get_latest_blockhash()?;
+
+        info!(%blockhash, "Fetched fresh blockhash");
+        Ok(blockhash)
+    }
+
     /// Fetches a blockhash based on current mode.
     /// FaultInjected mode returns a zeroed hash
     /// to simulate blockhash expiry.
     pub fn fetch(&self) -> Result<Hash> {
         match self.mode {
-            BlockhashMode::Normal => {
-                let blockhash = self.rpc_client.get_latest_blockhash()?;
-
-                info!(%blockhash, "Fetched fresh blockhash");
-                Ok(blockhash)
-            }
+            BlockhashMode::Normal => self.fetch_real(),
             BlockhashMode::FaultInjected => {
                 let expired = Hash::default();
                 info!("Fault injection active — returning expired blockhash");
                 Ok(expired)
             }
         }
+    }
+
+    /// Forces a real blockhash fetch even if fault injection is enabled.
+    pub fn fetch_fresh(&self) -> Result<Hash> {
+        self.fetch_real()
     }
 }

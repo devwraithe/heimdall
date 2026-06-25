@@ -3,9 +3,13 @@ export interface BundleOutcomeSummary {
   slot: number;
   stage: string;
   failureReason: string;
+  failureStage: string;
+  recovery: string;
   tipLamports: number;
   blockhash: string;
   submittedAt: number;
+  originalBundleId: string;
+  retryAttempt: number;
 }
 
 export interface OperationalSnapshot {
@@ -15,4 +19,7 @@ export interface OperationalSnapshot {
   recentOutcomes: BundleOutcomeSummary[];
   activeBundleCount: number;
   snapshotAt: number;
+  totalRetries: number;
+  totalRetriesSucceeded: number;
+  totalRetriesExhausted: number;
 }

@@ -45,12 +45,6 @@ impl IntelligenceEngine {
                 NetworkEvent::SlotUpdate { slot, status } => {
                     info!(slot, ?status, "Slot update received");
                 }
-                NetworkEvent::BlockObserved { slot } => {
-                    warn!(slot, "Block observed (not yet implemented)");
-                }
-                NetworkEvent::TransactionObserved { signature } => {
-                    warn!(%signature, "Transaction observed (not yet implemented)");
-                }
             }
         }
 
