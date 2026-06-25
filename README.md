@@ -11,14 +11,14 @@ Built for the Superteam Earn bounty: **Smart Transaction Infrastructure Stack**.
 
 ## Project Resources
 
-| Resource | URL |
-|---|---|
-| Documentation Site | [heimdall-docs.vercel.app](https://heimdall-docs.vercel.app) *(deploy with `cd docs && npm run build`)* |
-| Architecture Document | [ARCHITECTURE.md](./ARCHITECTURE.md) |
-| Operational Evidence Report | [EVIDENCE.md](./EVIDENCE.md) |
-| Live Monitoring (when running) | `http://localhost:3000` |
-| Evidence Export (when running) | `GET http://localhost:3000/evidence` |
-| SSE Real-Time Stream (when running) | `GET http://localhost:3000/events` |
+| Resource                            | URL                                                  |
+| ----------------------------------- | ---------------------------------------------------- |
+| Documentation Site                  | [heimdall-rosy.vercel.app](heimdall-rosy.vercel.app) |
+| Architecture Document               | [ARCHITECTURE.md](./ARCHITECTURE.md)                 |
+| Operational Evidence Report         | [EVIDENCE.md](./EVIDENCE.md)                         |
+| Live Monitoring (when running)      | `http://localhost:3000`                              |
+| Evidence Export (when running)      | `GET http://localhost:3000/evidence`                 |
+| SSE Real-Time Stream (when running) | `GET http://localhost:3000/events`                   |
 
 ---
 
@@ -207,6 +207,7 @@ bun run cli/heimdall.ts start
 ```
 
 The `monitor` command provides a live TUI dashboard with:
+
 - Real-time slot pulse and network status
 - Bundle outcomes table with stage, failure type, and retry lineage
 - AI agent decision history with confidence bars and risk assessment
@@ -543,18 +544,18 @@ which path confirmed each bundle.
 
 ### What to look for in the logs
 
-| Field | Where to find it | What it tells you |
-|---|---|---|
-| `bundle_id` | lifecycle.log | Unique Jito bundle identifier, verifiable on Jito Explorer |
-| `slot` | lifecycle.log | Target slot, verifiable on Solana Explorer |
-| `tip_lamports` | lifecycle.log | Real tip paid, demonstrates dynamic tip calculation |
-| `latency_processed_secs` | lifecycle.log | Time from submission to processed confirmation |
-| `confirmation_source` | lifecycle.log | Whether confirmed via Yellowstone stream or slot heuristic |
-| `failure_reason` | lifecycle.log | Machine-readable failure category |
-| `failure_stage` | lifecycle.log | Where in the pipeline the failure occurred |
-| `recovery` | lifecycle.log | Human-readable recovery guidance |
-| `original_bundle_id` | lifecycle.log | Links a retry to its original submission |
-| `retry_attempt` | lifecycle.log | Which retry attempt this was (0 = original) |
+| Field                    | Where to find it | What it tells you                                          |
+| ------------------------ | ---------------- | ---------------------------------------------------------- |
+| `bundle_id`              | lifecycle.log    | Unique Jito bundle identifier, verifiable on Jito Explorer |
+| `slot`                   | lifecycle.log    | Target slot, verifiable on Solana Explorer                 |
+| `tip_lamports`           | lifecycle.log    | Real tip paid, demonstrates dynamic tip calculation        |
+| `latency_processed_secs` | lifecycle.log    | Time from submission to processed confirmation             |
+| `confirmation_source`    | lifecycle.log    | Whether confirmed via Yellowstone stream or slot heuristic |
+| `failure_reason`         | lifecycle.log    | Machine-readable failure category                          |
+| `failure_stage`          | lifecycle.log    | Where in the pipeline the failure occurred                 |
+| `recovery`               | lifecycle.log    | Human-readable recovery guidance                           |
+| `original_bundle_id`     | lifecycle.log    | Links a retry to its original submission                   |
+| `retry_attempt`          | lifecycle.log    | Which retry attempt this was (0 = original)                |
 
 ---
 
@@ -614,10 +615,10 @@ Or use `bun run cli/heimdall.ts start` to launch all three at once.
 
 ### Troubleshooting
 
-| Symptom | Likely cause | Fix |
-|---|---|---|
-| "ECONNREFUSED 127.0.0.1:50051" | Rust core not running | Start core first |
-| "Rate limited" in agent output | Gemini API rate limit | Wait 30s, agent auto-recovers |
-| "Max retry attempts reached" | Bundle exhausted all 4 retries | Check failure type in logs |
-| "HOLD MODE active" | 3+ consecutive retry failures | Wait 60s for cooldown |
-| "Non-recoverable" in decisions | compute_exceeded or program_error | Fix the transaction payload |
+| Symptom                        | Likely cause                      | Fix                           |
+| ------------------------------ | --------------------------------- | ----------------------------- |
+| "ECONNREFUSED 127.0.0.1:50051" | Rust core not running             | Start core first              |
+| "Rate limited" in agent output | Gemini API rate limit             | Wait 30s, agent auto-recovers |
+| "Max retry attempts reached"   | Bundle exhausted all 4 retries    | Check failure type in logs    |
+| "HOLD MODE active"             | 3+ consecutive retry failures     | Wait 60s for cooldown         |
+| "Non-recoverable" in decisions | compute_exceeded or program_error | Fix the transaction payload   |
