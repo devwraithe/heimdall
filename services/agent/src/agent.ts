@@ -29,7 +29,7 @@ const NON_RECOVERABLE_TYPES = [
 
 export function localRulesEngine(snapshot: OperationalSnapshot): RetryDecision {
   const failedBundles = snapshot.recentOutcomes.filter(
-    (o) => o.stage === "Failed" || o.failureReason !== "",
+    (o) => o.stage === "Failed",
   );
   const totalRuns = snapshot.recentOutcomes.length;
   const landedRate =
@@ -40,7 +40,7 @@ export function localRulesEngine(snapshot: OperationalSnapshot): RetryDecision {
       : 1.0;
 
   const slotGap = snapshot.currentSlot - snapshot.latestFinalizedSlot;
-  const baseTip = snapshot.tipMedianLamports || 1_000;
+  const baseTip = snapshot.tipMedianLamports || 30_000;
 
   // ── Check hold mode ──
   if (Date.now() < holdModeUntil) {
@@ -107,17 +107,6 @@ export function localRulesEngine(snapshot: OperationalSnapshot): RetryDecision {
     };
   }
 
-  // ── Classify the dominant failure type ──
-  const failureTypes = failedBundles.map((b) => b.failureReason);
-  const hasExpiredBlockhash = failureTypes.some(
-    (f) =>
-      f.toLowerCase().includes("expired") ||
-      f.toLowerCase().includes("blockhash"),
-  );
-  const hasFeeTooLow = failureTypes.some(
-    (f) => f.toLowerCase().includes("fee") && f.toLowerCase().includes("low"),
-  );
-
   // ── High failure rate with few runs — hold ──
   if (landedRate < 0.3 && totalRuns >= 5) {
     consecutiveFailures++;
@@ -128,7 +117,35 @@ export function localRulesEngine(snapshot: OperationalSnapshot): RetryDecision {
       suggestedTipLamports: baseTip,
       failureClassification: failedBundles[0]?.failureReason || "Unknown",
       confidence: 0.85,
-      observedRisk: `Slot gap: ${slotGap}. Network may be under stress. ${failedBundles.length} recent failures detected.`,
+      observedRisk: `Recent failures: ${failedBundles.length}. Slot gap ${slotGap} is normal when finalized (~31 slots behind tip).`,
+    };
+  }
+
+  const failureTypes = failedBundles.map((b) => b.failureReason);
+  const hasExpiredBlockhash = failureTypes.some(
+    (f) =>
+      f.toLowerCase().includes("expired") ||
+      f.toLowerCase().includes("blockhash"),
+  );
+  const hasFeeTooLow = failureTypes.some(
+    (f) => f.toLowerCase().includes("fee") && f.toLowerCase().includes("low"),
+  );
+  const hasBundleNotLanded = failureTypes.some((f) =>
+    f.toLowerCase().includes("bundle_not_landed"),
+  );
+
+  // ── Bundle did not land (leader skip / confirmation timeout) ──
+  if (hasBundleNotLanded) {
+    consecutiveFailures = 0;
+    const tipPremium = Math.round(baseTip * 1.2);
+    return {
+      shouldRetry: true,
+      reason: `${failedBundles.length} bundle(s) did not land in the target leader window. Retrying with fresh blockhash and +20% tip premium for the next leader.`,
+      refreshBlockhash: true,
+      suggestedTipLamports: tipPremium,
+      failureClassification: "bundle_not_landed",
+      confidence: 0.85,
+      observedRisk: `Leader skip or insufficient inclusion probability. Slot gap ${slotGap}. Recalculate tip from live Jito floor before resubmitting.`,
     };
   }
 
@@ -197,7 +214,7 @@ async function geminiReasoning(
   localDecision: RetryDecision,
 ): Promise<RetryDecision> {
   const failedBundles = snapshot.recentOutcomes.filter(
-    (o) => o.stage === "Failed" || o.failureReason !== "",
+    (o) => o.stage === "Failed",
   );
 
   const prompt = `
@@ -253,7 +270,7 @@ Reason through this and respond ONLY with a valid JSON object:
   "reason": "your independent reasoning",
   "refreshBlockhash": true or false,
   "suggestedTipLamports": <number within constraints>,
-  "failureClassification": "expired_blockhash" | "fee_too_low" | "bundle_failure" | "compute_exceeded" | "unknown",
+  "failureClassification": "expired_blockhash" | "fee_too_low" | "bundle_failure" | "bundle_not_landed" | "compute_exceeded" | "unknown",
   "confidence": <0.0 to 1.0>,
   "observedRisk": "plain-english risk assessment"
 }`;
