@@ -15,6 +15,8 @@ pub enum FailureReason {
     ComputeExceeded,
     /// Jito-level bundle rejection.
     BundleFailure,
+    /// Bundle never landed (leader skip, empty getBundleStatuses after polling window).
+    BundleNotLanded,
     /// Unclassified failure — raw message preserved for debugging.
     Unknown(String),
 }
@@ -27,6 +29,7 @@ impl FailureReason {
             Self::FeeTooLow => "fee_too_low",
             Self::ComputeExceeded => "compute_exceeded",
             Self::BundleFailure => "bundle_failure",
+            Self::BundleNotLanded => "bundle_not_landed",
             Self::Unknown(_) => "unknown",
         }
     }
@@ -45,6 +48,9 @@ impl FailureReason {
             }
             Self::BundleFailure => {
                 "Bundle was rejected by Jito. Check that the bundle contains valid transactions with correct signatures. Rebuild and resubmit."
+            }
+            Self::BundleNotLanded => {
+                "Bundle did not land in the target leader window (likely leader skip or insufficient tip). Fetch a fresh blockhash, recalculate tip from the Jito tip floor API, and resubmit for the next leader window."
             }
             Self::Unknown(_) => {
                 "Unclassified failure. Inspect the raw Jito response for details. Retry with a fresh blockhash and recalculated tip."

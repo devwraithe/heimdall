@@ -5,12 +5,18 @@ use anyhow::Result;
 use jito_sdk_rust::JitoJsonRpcSDK;
 use shared::engine::OperationalState;
 use shared::types::{
-    ConfirmationReceiver, InfraConfig, SlotConfirmation, SubmissionReceiver, SubmissionRecord,
+    ConfirmationReceiver, ConfirmationSender, InfraConfig, SlotConfirmation, SubmissionReceiver,
+    SubmissionRecord,
 };
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tracing::{error, info, warn};
+
+const JITO_POLL_DELAYS_SECS: &[u64] = &[5, 10, 15, 20, 30];
+const RPC_POLL_START_SECS: u64 = 8;
+const RPC_POLL_INTERVAL_SECS: u64 = 4;
+const RPC_POLL_MAX_ATTEMPTS: u32 = 12;
 
 fn classify_bundle_response(
     response: &serde_json::Value,
@@ -22,7 +28,7 @@ fn classify_bundle_response(
             return Some(FailureReason::ExpiredBlockhash);
         }
 
-        return Some(FailureReason::Unknown("BundleMissing".to_string()));
+        return Some(FailureReason::BundleNotLanded);
     }
 
     let status_text = value[0]["status"].as_str().unwrap_or_default();
@@ -90,6 +96,140 @@ fn classify_bundle_response(
     ))
 }
 
+fn failure_stage_for(reason: &FailureReason) -> FailureStage {
+    match reason {
+        FailureReason::ExpiredBlockhash => FailureStage::Execution,
+        FailureReason::FeeTooLow => FailureStage::Submission,
+        FailureReason::ComputeExceeded => FailureStage::Execution,
+        FailureReason::BundleFailure => FailureStage::Execution,
+        FailureReason::BundleNotLanded => FailureStage::Confirmation,
+        FailureReason::Unknown(_) => FailureStage::Confirmation,
+    }
+}
+
+fn push_outcome_to_state(
+    operational_state: &Arc<Mutex<OperationalState>>,
+    outcome: &BundleOutcome,
+    stage: &str,
+    failure_reason: Option<&FailureReason>,
+) {
+    if let Ok(mut state) = operational_state.lock() {
+        state.record_outcome(shared::types::BundleOutcomeSummary {
+            bundle_id: outcome.bundle_id.clone(),
+            slot: outcome.slot,
+            stage: stage.to_string(),
+            failure_reason: failure_reason
+                .map(|r| r.failure_type().to_string())
+                .unwrap_or_default(),
+            failure_stage: failure_reason
+                .map(|r| failure_stage_for(r).as_str().to_string())
+                .unwrap_or_default(),
+            recovery: failure_reason
+                .map(|r| r.recovery_guidance().to_string())
+                .unwrap_or_default(),
+            tip_lamports: outcome.tip_lamports,
+            blockhash: outcome.blockhash.clone(),
+            submitted_at: outcome.submitted_at,
+            original_bundle_id: outcome.original_bundle_id.clone().unwrap_or_default(),
+            retry_attempt: outcome.retry_attempt,
+        });
+    }
+}
+
+fn lifecycle_entry_from_outcome(outcome: &BundleOutcome, status: &str) -> LifecycleEntry {
+    let (failure_reason, failure_stage, recovery) = match &outcome.stage {
+        CommitmentStage::Failed(reason) => (
+            Some(reason.failure_type().to_string()),
+            Some(failure_stage_for(reason).as_str().to_string()),
+            Some(reason.recovery_guidance().to_string()),
+        ),
+        _ => (None, None, None),
+    };
+
+    LifecycleEntry {
+        bundle_id: outcome.bundle_id.clone(),
+        slot: outcome.slot,
+        leader: outcome.leader.clone(),
+        tip_lamports: outcome.tip_lamports,
+        blockhash: outcome.blockhash.clone(),
+        confirmation_source: outcome.confirmation_source.clone(),
+        submitted_at: outcome.submitted_at,
+        processed_at: outcome.processed_at,
+        confirmed_at: outcome.confirmed_at,
+        finalized_at: outcome.finalized_at,
+        processed_slot: outcome.processed_slot,
+        confirmed_slot: outcome.confirmed_slot,
+        finalized_slot: outcome.finalized_slot,
+        latency_processed_secs: outcome.latency_processed(),
+        latency_confirmed_secs: outcome.latency_confirmed(),
+        latency_finalized_secs: outcome.latency_finalized(),
+        status: status.to_string(),
+        failure_reason,
+        failure_stage,
+        recovery,
+        original_bundle_id: outcome.original_bundle_id.clone(),
+        retry_attempt: outcome.retry_attempt,
+    }
+}
+
+async fn poll_jito_until_terminal(
+    jito_url: &str,
+    bundle_id: &str,
+    blockhash: &str,
+    already_resolved: &Arc<AtomicBool>,
+) -> Option<FailureReason> {
+    let client = JitoJsonRpcSDK::new(jito_url, None);
+    let bundle_ids = vec![bundle_id.to_string()];
+
+    for delay in JITO_POLL_DELAYS_SECS {
+        tokio::time::sleep(tokio::time::Duration::from_secs(*delay)).await;
+
+        if already_resolved.load(Ordering::SeqCst) {
+            info!(bundle_id = %bundle_id, "Bundle resolved before Jito poll completed");
+            return None;
+        }
+
+        match client.get_bundle_statuses(bundle_ids.clone()).await {
+            Ok(response) => {
+                if let Some(failure_reason) = classify_bundle_response(&response, blockhash) {
+                    if matches!(failure_reason, FailureReason::BundleNotLanded) {
+                        continue;
+                    }
+
+                    warn!(
+                        bundle_id = %bundle_id,
+                        failure_type = failure_reason.failure_type(),
+                        delay_secs = delay,
+                        "Jito poll observed explicit failure status"
+                    );
+                    return Some(failure_reason);
+                }
+
+                info!(
+                    bundle_id = %bundle_id,
+                    delay_secs = delay,
+                    "Jito poll shows bundle pending or landed"
+                );
+                return None;
+            }
+            Err(e) => {
+                warn!(
+                    bundle_id = %bundle_id,
+                    delay_secs = delay,
+                    error = %e,
+                    "Jito poll request failed, will retry"
+                );
+            }
+        }
+    }
+
+    if already_resolved.load(Ordering::SeqCst) {
+        return None;
+    }
+
+    Some(FailureReason::BundleNotLanded)
+}
+
 /// Maintains a live registry of all in-flight bundles.
 /// Receives SubmissionRecords from L3 and tracks each
 /// bundle through commitment stages to final outcome.
@@ -97,6 +237,7 @@ pub struct OutcomeTracker {
     /// Incoming submission records from L3
     receiver: SubmissionReceiver,
     confirmation_receiver: ConfirmationReceiver,
+    confirmation_tx: ConfirmationSender,
     /// Live registry of bundles keyed by bundle ID
     bundles: HashMap<String, BundleOutcome>,
     /// Latest finalized slot seen by the tracker
@@ -111,12 +252,14 @@ impl OutcomeTracker {
     pub fn new(
         receiver: SubmissionReceiver,
         confirmation_receiver: ConfirmationReceiver,
+        confirmation_tx: ConfirmationSender,
         config: InfraConfig,
         operational_state: Arc<Mutex<OperationalState>>,
     ) -> Self {
         Self {
             receiver,
             confirmation_receiver,
+            confirmation_tx,
             bundles: HashMap::new(),
             latest_finalized_slot: 0,
             jito_url: config.jito_url,
@@ -129,9 +272,9 @@ impl OutcomeTracker {
     /// Registers a new bundle from a SubmissionRecord.
     /// Creates a fresh BundleOutcome and adds it to the registry.
     pub fn register(&mut self, record: SubmissionRecord) {
-        // Set to true when bundle finalizes successfully
         let already_resolved = Arc::new(AtomicBool::new(false));
         let already_resolved_for_poll = Arc::clone(&already_resolved);
+        let already_resolved_for_rpc = Arc::clone(&already_resolved);
 
         let outcome = BundleOutcome::new(
             record.bundle_id.clone(),
@@ -162,124 +305,64 @@ impl OutcomeTracker {
             "Bundle registered for tracking"
         );
 
-        let bundle_id_1 = record.bundle_id.clone();
-        let bundle_id_2 = record.bundle_id.clone();
+        let bundle_id_for_poll = record.bundle_id.clone();
+        let bundle_id_for_rpc = record.bundle_id.clone();
+        self.bundles
+            .insert(record.bundle_id.clone(), outcome.clone());
 
-        self.bundles.insert(bundle_id_1, outcome.clone());
-
-        // Spawn status poll
-        let bundle_id = bundle_id_2;
+        // Jito status poll — waits through multiple intervals before classifying failure
         let jito_url = self.jito_url.clone();
         let operational_state = Arc::clone(&self.operational_state);
+        let poll_blockhash = outcome.blockhash.clone();
+        let poll_outcome = outcome.clone();
 
         tokio::spawn(async move {
-            let client = JitoJsonRpcSDK::new(&jito_url, None);
-            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-            let bundle_ids = vec![bundle_id.clone()];
-
-            // If bundle already resolved via stream, skip failure classification
-            if already_resolved_for_poll.load(Ordering::SeqCst) {
-                info!(bundle_id = %bundle_id.clone(), "Bundle already resolved, skipping poll classification");
-                return;
-            }
-
-            match client.get_bundle_statuses(bundle_ids).await {
-                Ok(response) => {
-                    if let Some(failure_reason) =
-                        classify_bundle_response(&response, &outcome.blockhash)
-                    {
-                        let failure_stage = FailureStage::Execution;
-
-                        warn!(
-                            bundle_id = %bundle_id,
-                            failure_type = failure_reason.failure_type(),
-                            failure_stage = failure_stage.as_str(),
-                            "Bundle classified as failed"
-                        );
-
-                        let entry = LifecycleEntry {
-                            bundle_id: bundle_id.clone(),
-                            slot: outcome.slot,
-                            leader: outcome.leader.clone(),
-                            tip_lamports: outcome.tip_lamports,
-                            blockhash: outcome.blockhash.clone(),
-                            confirmation_source: outcome.confirmation_source.clone(),
-                            submitted_at: outcome.submitted_at,
-                            processed_at: outcome.processed_at,
-                            confirmed_at: outcome.confirmed_at,
-                            finalized_at: outcome.finalized_at,
-                            processed_slot: outcome.processed_slot,
-                            confirmed_slot: outcome.confirmed_slot,
-                            finalized_slot: outcome.finalized_slot,
-                            latency_processed_secs: outcome.latency_processed(),
-                            latency_confirmed_secs: outcome.latency_confirmed(),
-                            latency_finalized_secs: outcome.latency_finalized(),
-                            status: "Failed".to_string(),
-                            failure_reason: Some(failure_reason.failure_type().to_string()),
-                            failure_stage: Some(failure_stage.as_str().to_string()),
-                            recovery: Some(failure_reason.recovery_guidance().to_string()),
-                            original_bundle_id: outcome.original_bundle_id.clone(),
-                            retry_attempt: outcome.retry_attempt,
-                        };
-
-                        write_entry(&entry);
-
-                        if let Ok(mut state) = operational_state.lock() {
-                            state.record_outcome(shared::types::BundleOutcomeSummary {
-                                bundle_id: bundle_id.clone(),
-                                slot: outcome.slot,
-                                stage: "Failed".to_string(),
-                                failure_reason: failure_reason.failure_type().to_string(),
-                                failure_stage: failure_stage.as_str().to_string(),
-                                recovery: failure_reason.recovery_guidance().to_string(),
-                                tip_lamports: outcome.tip_lamports,
-                                blockhash: outcome.blockhash.clone(),
-                                submitted_at: outcome.submitted_at,
-                                original_bundle_id: outcome
-                                    .original_bundle_id
-                                    .clone()
-                                    .unwrap_or_default(),
-                                retry_attempt: outcome.retry_attempt,
-                            });
-                            info!(bundle_id = %bundle_id, "Failed outcome pushed to L5");
-                        }
-                    } else {
-                        info!(bundle_id = %bundle_id, response = %response, "Bundle status polled");
-                    }
+            if let Some(failure_reason) = poll_jito_until_terminal(
+                &jito_url,
+                &bundle_id_for_poll,
+                &poll_blockhash,
+                &already_resolved_for_poll,
+            )
+            .await
+            {
+                if already_resolved_for_poll.load(Ordering::SeqCst) {
+                    return;
                 }
-                Err(e) => {
-                    error!(bundle_id = %bundle_id, error = %e, "Failed to poll bundle status")
+
+                let failure_stage = failure_stage_for(&failure_reason);
+
+                warn!(
+                    bundle_id = %bundle_id_for_poll,
+                    failure_type = failure_reason.failure_type(),
+                    failure_stage = failure_stage.as_str(),
+                    "Bundle classified as failed after Jito polling window"
+                );
+
+                let mut failed_outcome = poll_outcome.clone();
+                failed_outcome.stage = CommitmentStage::Failed(failure_reason.clone());
+
+                let entry = lifecycle_entry_from_outcome(&failed_outcome, "Failed");
+                write_entry(&entry);
+                push_outcome_to_state(
+                    &operational_state,
+                    &failed_outcome,
+                    "Failed",
+                    Some(&failure_reason),
+                );
+                if let Ok(mut state) = operational_state.lock() {
+                    state.bundle_resolved();
                 }
+                already_resolved_for_poll.store(true, Ordering::SeqCst);
             }
         });
 
-        // Spawn RPC fallback confirmation (dual-path resilience)
-        // If Yellowstone/Jito haven't confirmed within 15s, poll via RPC getSignatureStatuses
+        // RPC confirmation fallback — feeds signature-based confirmations back into L4
         let rpc_url = self.rpc_url.clone();
         let fallback_signatures = record.transaction_signatures.clone();
-        let fallback_bundle_id = record.bundle_id.clone();
-        let fallback_state = Arc::clone(&self.operational_state);
+        let confirmation_tx = self.confirmation_tx.clone();
 
         tokio::spawn(async move {
-            // Wait 15s — give Yellowstone and Jito polling time to confirm first
-            tokio::time::sleep(tokio::time::Duration::from_secs(15)).await;
-
-            // Check if already confirmed by inspecting state
-            {
-                let state = fallback_state.lock().unwrap();
-                let already_confirmed = state.recent_outcomes.iter().any(|o| {
-                    o.bundle_id == fallback_bundle_id
-                        && (o.stage == "Finalized" || o.stage == "Confirmed" || o.stage == "Failed")
-                });
-                if already_confirmed {
-                    return; // Already resolved via primary path
-                }
-            }
-
-            info!(
-                bundle_id = %fallback_bundle_id,
-                "RPC fallback: checking getSignatureStatuses"
-            );
+            tokio::time::sleep(tokio::time::Duration::from_secs(RPC_POLL_START_SECS)).await;
 
             let rpc_client = solana_client::rpc_client::RpcClient::new(rpc_url);
             let sigs: Vec<solana_sdk::signature::Signature> = fallback_signatures
@@ -291,57 +374,77 @@ impl OutcomeTracker {
                 return;
             }
 
-            match rpc_client.get_signature_statuses(&sigs) {
-                Ok(response) => {
-                    for (i, status_opt) in response.value.iter().enumerate() {
-                        if let Some(status) = status_opt {
-                            let confirmation = if status.satisfies_commitment(
+            for attempt in 0..RPC_POLL_MAX_ATTEMPTS {
+                if already_resolved_for_rpc.load(Ordering::SeqCst) {
+                    return;
+                }
+
+                match rpc_client.get_signature_statuses(&sigs) {
+                    Ok(response) => {
+                        for (i, status_opt) in response.value.iter().enumerate() {
+                            let Some(status) = status_opt else {
+                                continue;
+                            };
+
+                            let commitment = if status.satisfies_commitment(
                                 solana_sdk::commitment_config::CommitmentConfig::finalized(),
                             ) {
-                                "Finalized"
+                                2u32
                             } else if status.satisfies_commitment(
                                 solana_sdk::commitment_config::CommitmentConfig::confirmed(),
                             ) {
-                                "Confirmed"
+                                1u32
                             } else {
-                                "Processed"
+                                0u32
                             };
 
                             info!(
-                                bundle_id = %fallback_bundle_id,
+                                bundle_id = %bundle_id_for_rpc,
                                 signature = %fallback_signatures[i],
-                                status = confirmation,
+                                commitment,
                                 slot = status.slot,
-                                "RPC fallback confirmed bundle"
+                                attempt,
+                                "RPC fallback observed signature status"
                             );
 
-                            // Update operational state with RPC confirmation
-                            if let Ok(mut state) = fallback_state.lock() {
-                                for outcome in state.recent_outcomes.iter_mut() {
-                                    if outcome.bundle_id == fallback_bundle_id
-                                        && outcome.stage != "Finalized"
-                                        && outcome.stage != "Failed"
-                                    {
-                                        outcome.stage = confirmation.to_string();
-                                    }
-                                }
+                            if let Err(e) = confirmation_tx
+                                .send(SlotConfirmation {
+                                    slot: status.slot,
+                                    commitment,
+                                    signature: Some(fallback_signatures[i].clone()),
+                                })
+                                .await
+                            {
+                                warn!(
+                                    bundle_id = %bundle_id_for_rpc,
+                                    error = %e,
+                                    "Failed to forward RPC fallback confirmation"
+                                );
                             }
-                            return; // One confirmed sig is enough
+
+                            if commitment >= 1 {
+                                return;
+                            }
                         }
                     }
-                    warn!(
-                        bundle_id = %fallback_bundle_id,
-                        "RPC fallback: no signature statuses found"
-                    );
+                    Err(e) => {
+                        warn!(
+                            bundle_id = %bundle_id_for_rpc,
+                            attempt,
+                            error = %e,
+                            "RPC fallback getSignatureStatuses failed"
+                        );
+                    }
                 }
-                Err(e) => {
-                    warn!(
-                        bundle_id = %fallback_bundle_id,
-                        error = %e,
-                        "RPC fallback: getSignatureStatuses failed"
-                    );
-                }
+
+                tokio::time::sleep(tokio::time::Duration::from_secs(RPC_POLL_INTERVAL_SECS))
+                    .await;
             }
+
+            warn!(
+                bundle_id = %bundle_id_for_rpc,
+                "RPC fallback exhausted without confirmation"
+            );
         });
     }
 
@@ -355,6 +458,15 @@ impl OutcomeTracker {
         slot: u64,
         confirmation_source: &str,
     ) {
+        if self
+            .bundles
+            .get(bundle_id)
+            .map(|o| o.already_resolved.load(Ordering::SeqCst))
+            .unwrap_or(true)
+        {
+            return;
+        }
+
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -362,48 +474,62 @@ impl OutcomeTracker {
 
         let should_evict = match self.bundles.get_mut(bundle_id) {
             Some(outcome) => {
-                match &stage {
-                    CommitmentStage::Processed => {
-                        outcome.processed_at = Some(now);
-                        outcome.processed_slot = Some(slot);
-                    }
-                    CommitmentStage::Confirmed => {
-                        outcome.confirmed_at = Some(now);
-                        outcome.confirmed_slot = Some(slot);
-                    }
-                    CommitmentStage::Finalized => {
-                        outcome.finalized_at = Some(now);
-                        outcome.finalized_slot = Some(slot);
-                    }
-                    CommitmentStage::Failed(reason) => {
-                        warn!(bundle_id, ?reason, "Bundle failed");
-                    }
-                    _ => {}
-                }
+                let stage_rank = |s: &CommitmentStage| match s {
+                    CommitmentStage::Submitted => 0,
+                    CommitmentStage::Processed => 1,
+                    CommitmentStage::Confirmed => 2,
+                    CommitmentStage::Finalized => 3,
+                    CommitmentStage::Failed(_) => 4,
+                };
 
-                if outcome.confirmation_source == "pending"
-                    || (confirmation_source == "yellowstone_stream"
-                        && outcome.confirmation_source != "yellowstone_stream")
+                if stage_rank(&stage) <= stage_rank(&outcome.stage)
+                    && !matches!(stage, CommitmentStage::Failed(_))
                 {
-                    outcome.confirmation_source = confirmation_source.to_string();
+                    false
+                } else {
+                    match &stage {
+                        CommitmentStage::Processed => {
+                            outcome.processed_at = Some(now);
+                            outcome.processed_slot = Some(slot);
+                        }
+                        CommitmentStage::Confirmed => {
+                            outcome.confirmed_at = Some(now);
+                            outcome.confirmed_slot = Some(slot);
+                        }
+                        CommitmentStage::Finalized => {
+                            outcome.finalized_at = Some(now);
+                            outcome.finalized_slot = Some(slot);
+                        }
+                        CommitmentStage::Failed(reason) => {
+                            warn!(bundle_id, ?reason, "Bundle failed");
+                        }
+                        _ => {}
+                    }
+
+                    if outcome.confirmation_source == "pending"
+                        || (confirmation_source == "yellowstone_stream"
+                            && outcome.confirmation_source != "yellowstone_stream")
+                    {
+                        outcome.confirmation_source = confirmation_source.to_string();
+                    }
+
+                    outcome.stage = stage.clone();
+
+                    info!(
+                        bundle_id,
+                        slot,
+                        ?outcome.stage,
+                        confirmation_source = outcome.confirmation_source,
+                        latency_processed = ?outcome.latency_processed(),
+                        latency_confirmed = ?outcome.latency_confirmed(),
+                        "Bundle stage updated"
+                    );
+
+                    matches!(
+                        stage,
+                        CommitmentStage::Finalized | CommitmentStage::Failed(_)
+                    )
                 }
-
-                outcome.stage = stage.clone();
-
-                info!(
-                    bundle_id,
-                    slot,
-                    ?outcome.stage,
-                    latency_processed = ?outcome.latency_processed(),
-                    latency_confirmed = ?outcome.latency_confirmed(),
-                    "Bundle stage updated"
-                );
-
-                // Signal eviction for terminal stages
-                matches!(
-                    stage,
-                    CommitmentStage::Finalized | CommitmentStage::Failed(_)
-                )
             }
             None => {
                 warn!(bundle_id, "Received update for untracked bundle");
@@ -411,7 +537,6 @@ impl OutcomeTracker {
             }
         };
 
-        // Evict after mutable borrow is released
         if should_evict {
             if let Some(outcome) = self.bundles.remove(bundle_id) {
                 outcome.already_resolved.store(true, Ordering::SeqCst);
@@ -424,56 +549,30 @@ impl OutcomeTracker {
                     state.bundle_resolved();
                 }
 
+                let (status, failure_reason) = match &outcome.stage {
+                    CommitmentStage::Finalized => ("Finalized", None),
+                    CommitmentStage::Failed(reason) => ("Failed", Some(reason.clone())),
+                    _ => ("Unknown", None),
+                };
+
                 info!(
                     bundle_id,
+                    status,
                     latency_processed = ?outcome.latency_processed(),
                     latency_confirmed = ?outcome.latency_confirmed(),
                     latency_finalized = ?outcome.latency_finalized(),
                     "Bundle lifecycle complete, evicted from registry"
                 );
 
-                // Write to lifecycle log
-                let entry = LifecycleEntry {
-                    bundle_id: outcome.bundle_id.clone(),
-                    slot: outcome.slot,
-                    leader: outcome.leader.clone(),
-                    tip_lamports: outcome.tip_lamports,
-                    blockhash: outcome.blockhash.clone(),
-                    confirmation_source: outcome.confirmation_source.clone(),
-                    submitted_at: outcome.submitted_at,
-                    processed_at: outcome.processed_at,
-                    confirmed_at: outcome.confirmed_at,
-                    finalized_at: outcome.finalized_at,
-                    processed_slot: outcome.processed_slot,
-                    confirmed_slot: outcome.confirmed_slot,
-                    finalized_slot: outcome.finalized_slot,
-                    latency_processed_secs: outcome.latency_processed(),
-                    latency_confirmed_secs: outcome.latency_confirmed(),
-                    latency_finalized_secs: outcome.latency_finalized(),
-                    status: match &outcome.stage {
-                        CommitmentStage::Finalized => "Finalized".to_string(),
-                        CommitmentStage::Failed(_) => "Failed".to_string(),
-                        _ => "Unknown".to_string(),
-                    },
-                    failure_reason: match &outcome.stage {
-                        CommitmentStage::Failed(reason) => Some(reason.failure_type().to_string()),
-                        _ => None,
-                    },
-                    failure_stage: match &outcome.stage {
-                        CommitmentStage::Failed(_) => Some("confirmation".to_string()),
-                        _ => None,
-                    },
-                    recovery: match &outcome.stage {
-                        CommitmentStage::Failed(reason) => {
-                            Some(reason.recovery_guidance().to_string())
-                        }
-                        _ => None,
-                    },
-                    original_bundle_id: outcome.original_bundle_id.clone(),
-                    retry_attempt: outcome.retry_attempt,
-                };
-
+                let entry = lifecycle_entry_from_outcome(&outcome, status);
                 write_entry(&entry);
+
+                push_outcome_to_state(
+                    &self.operational_state,
+                    &outcome,
+                    status,
+                    failure_reason.as_ref(),
+                );
             }
         }
     }
@@ -485,12 +584,10 @@ impl OutcomeTracker {
 
         loop {
             tokio::select! {
-                // Incoming submission from L3
                 Some(record) = self.receiver.recv() => {
                     self.register(record);
                 }
 
-                // Incoming slot confirmation from L1
                 Some(confirmation) = self.confirmation_receiver.recv() => {
                     self.handle_confirmation(confirmation);
                 }
@@ -506,9 +603,16 @@ impl OutcomeTracker {
     }
 
     /// Handles an incoming slot confirmation from L1.
-    /// Finds any registered bundle targeting this slot
-    /// and advances its commitment stage.
+    /// Signature-based confirmations advance bundle stages.
+    /// Slot-only updates only track network finalized height.
     fn handle_confirmation(&mut self, confirmation: SlotConfirmation) {
+        if confirmation.signature.is_none() {
+            if confirmation.commitment == 2 && confirmation.slot > self.latest_finalized_slot {
+                self.latest_finalized_slot = confirmation.slot;
+            }
+            return;
+        }
+
         let stage = match confirmation.commitment {
             0 => CommitmentStage::Processed,
             1 => CommitmentStage::Confirmed,
@@ -516,45 +620,21 @@ impl OutcomeTracker {
             _ => return,
         };
 
-        // Track latest finalized slot
-        if matches!(stage, CommitmentStage::Finalized) {
-            if confirmation.slot > self.latest_finalized_slot {
-                self.latest_finalized_slot = confirmation.slot;
-            }
+        if matches!(stage, CommitmentStage::Finalized)
+            && confirmation.slot > self.latest_finalized_slot
+        {
+            self.latest_finalized_slot = confirmation.slot;
         }
 
         if let Some(signature) = confirmation.signature.as_ref() {
             if let Some(bundle_id) = self.signature_index.get(signature).cloned() {
-                self.update_stage(&bundle_id, stage, confirmation.slot, "yellowstone_stream");
-                return;
+                let source = if confirmation.commitment == 0 {
+                    "yellowstone_stream"
+                } else {
+                    "rpc_polling_fallback"
+                };
+                self.update_stage(&bundle_id, stage, confirmation.slot, source);
             }
-        }
-
-        // Match bundles whose target slot is within
-        // a reasonable window of the confirmed slot
-        let matching_ids: Vec<String> = self
-            .bundles
-            .iter()
-            .filter(|(_, outcome)| {
-                let slot_diff = confirmation.slot as i64 - outcome.slot as i64;
-                // Only match slots at or ahead of bundle target
-                // and only confirmations that arrived after registration
-                slot_diff >= 0 && slot_diff <= 64 && confirmation.slot >= outcome.registered_at_slot
-            })
-            .map(|(id, _)| id.clone())
-            .collect();
-
-        if matching_ids.is_empty() {
-            return;
-        }
-
-        for bundle_id in matching_ids {
-            self.update_stage(
-                &bundle_id,
-                stage.clone(),
-                confirmation.slot,
-                "slot_heuristic",
-            );
         }
     }
 }
@@ -569,6 +649,13 @@ mod tests {
         let response = json!({ "result": { "value": [] } });
         let reason = classify_bundle_response(&response, "11111111111111111111111111111111");
         assert!(matches!(reason, Some(FailureReason::ExpiredBlockhash)));
+    }
+
+    #[test]
+    fn classifies_missing_bundle_as_not_landed_with_real_blockhash() {
+        let response = json!({ "result": { "value": [] } });
+        let reason = classify_bundle_response(&response, "some-real-blockhash");
+        assert!(matches!(reason, Some(FailureReason::BundleNotLanded)));
     }
 
     #[test]

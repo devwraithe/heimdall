@@ -6,6 +6,10 @@ use std::env;
 use std::str::FromStr;
 use tracing::{info, warn};
 
+const TIP_FLOOR_URL: &str = "https://bundles.jito.wtf/api/v1/bundles/tip_floor";
+const DEFAULT_TIP_MIN_LAMPORTS: u64 = 30_000;
+const DEFAULT_TIP_MAX_LAMPORTS: u64 = 100_000;
+
 fn tip_premium_percent() -> f64 {
     env::var("TIP_PREMIUM_PERCENT")
         .ok()
@@ -17,7 +21,18 @@ fn tip_min_lamports() -> u64 {
     env::var("TIP_MIN_LAMPORTS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(1_000)
+        .unwrap_or(DEFAULT_TIP_MIN_LAMPORTS)
+}
+
+fn tip_max_lamports() -> u64 {
+    env::var("TIP_MAX_LAMPORTS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_TIP_MAX_LAMPORTS)
+}
+
+fn clamp_tip(tip: u64) -> u64 {
+    tip.clamp(tip_min_lamports(), tip_max_lamports())
 }
 
 const DEFAULT_JITO_TIP_ACCOUNTS: [&str; 8] = [
@@ -25,7 +40,7 @@ const DEFAULT_JITO_TIP_ACCOUNTS: [&str; 8] = [
     "HFqU5x63VTqvB8BoaQmX1DRunAoUnFYzaqAmqn1B7bMA",
     "Cw8CFyM9FkoMi7K7Crf6HNQqf4uEMzpKw6QNghXLvLkY",
     "ADaUMid9yfUytqMBgopwjb2DTLSokTSzL1zt6iGPaS49",
-    "DfXygSm4jCyNCybVYYK6DwvWqjKee8pbDmJGcLWNDXjh",
+    "DfXygSm4jCyNCybVYYK6DwvWqjKee5pbDmJGcLWNDXjh",
     "ADuUkR4vqLUMWXxW9gh6D6L8pMSawimctcNZ5pGwDcEt",
     "DttWaMuVvTiduZRnguLF7jNxTgiMBZ1hyAumKUiL2KRL",
     "3AVi9Tg9Uo68tJfuvoKvqKNWKkC5wPdSSdeBnizKZ6jT",
@@ -51,7 +66,21 @@ fn derive_tip_from_balances(balances: &[u64]) -> u64 {
     let mut sorted = balances.to_vec();
     sorted.sort_unstable();
     let median = sorted[sorted.len() / 2];
-    (median as f64 * premium).round() as u64
+    clamp_tip((median as f64 * premium).round() as u64)
+}
+
+async fn fetch_tip_floor_p75_lamports() -> Option<u64> {
+    let response = reqwest::get(TIP_FLOOR_URL).await.ok()?;
+    let payload: serde_json::Value = response.json().await.ok()?;
+    let sol = payload[0]["landed_tips_75th_percentile"]
+        .as_f64()
+        .or_else(|| payload["landed_tips_75th_percentile"].as_f64())?;
+
+    if sol <= 0.0 {
+        return None;
+    }
+
+    Some(clamp_tip((sol * 1_000_000_000.0).round() as u64))
 }
 
 // Fetches real tip account data and calculates a competitive tip amount in lamports
@@ -69,7 +98,6 @@ impl TipCalculator {
     }
 
     fn calculate_from_balances(&self) -> Result<u64> {
-        // Fetch balances of all 8 tip accounts
         let balances: Vec<u64> = get_jito_tip_accounts()
             .iter()
             .filter_map(|addr| {
@@ -80,8 +108,7 @@ impl TipCalculator {
             .collect();
 
         if balances.is_empty() {
-            // Fallback minimum if RPC fails entirely
-            let fallback = 1_000;
+            let fallback = tip_min_lamports();
             info!(
                 tip_lamports = fallback,
                 "No tip data available, using fallback minimum"
@@ -89,28 +116,35 @@ impl TipCalculator {
             return Ok(fallback);
         }
 
-        let median = balances[balances.len() / 2];
-        let tip = derive_tip_from_balances(&balances).max(tip_min_lamports());
+        let tip = derive_tip_from_balances(&balances);
 
         info!(
-            median_lamports = median,
             tip_lamports = tip,
             accounts_sampled = balances.len(),
-            "Tip calculated from live data"
+            "Tip calculated from live tip-account balances (clamped)"
         );
 
         Ok(tip)
     }
 
-    // Fetches the current Jito recommended tip when available, then falls back to the median-balance proxy.
     pub async fn calculate(&self) -> Result<u64> {
+        if let Some(tip) = fetch_tip_floor_p75_lamports().await {
+            info!(
+                tip_lamports = tip,
+                "Tip fetched from Jito tip floor API (p75, clamped)"
+            );
+            return Ok(tip);
+        }
+
         let tip = match self.tip_client.get_recommended_tip().await {
             Ok(recommended) if recommended > 0 => {
+                let clamped = clamp_tip(recommended);
                 info!(
-                    tip_lamports = recommended,
-                    "Tip fetched from Jito recommended tip API"
+                    tip_lamports = clamped,
+                    raw_recommended = recommended,
+                    "Tip fetched from Jito recommended tip API (clamped)"
                 );
-                recommended
+                clamped
             }
             Ok(_) => {
                 warn!("Jito recommended tip returned zero, falling back to balance proxy");
@@ -122,13 +156,13 @@ impl TipCalculator {
             }
         };
 
-        Ok(tip.max(tip_min_lamports()))
+        Ok(tip)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::derive_tip_from_balances;
+    use super::{clamp_tip, derive_tip_from_balances, tip_max_lamports, tip_min_lamports};
 
     #[test]
     fn derives_tip_from_median_balance() {
@@ -137,6 +171,12 @@ mod tests {
 
     #[test]
     fn tip_has_floor_when_balances_are_empty() {
-        assert_eq!(derive_tip_from_balances(&[]), 1_000);
+        assert_eq!(derive_tip_from_balances(&[]), tip_min_lamports());
+    }
+
+    #[test]
+    fn clamp_respects_bounds() {
+        assert_eq!(clamp_tip(1), tip_min_lamports());
+        assert_eq!(clamp_tip(999_999_999), tip_max_lamports());
     }
 }

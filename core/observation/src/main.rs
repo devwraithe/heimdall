@@ -431,10 +431,12 @@ async fn main() -> anyhow::Result<()> {
     });
 
     // Spawn L4 outcome tracker
+    let confirmation_tx_for_l4 = confirmation_tx.clone();
     tokio::spawn(async move {
         let mut tracker = OutcomeTracker::new(
             submission_rx,
             confirmation_rx,
+            confirmation_tx_for_l4,
             InfraConfig {
                 jito_url: jito_url_for_l4,
                 rpc_url: rpc_url_for_l4,

@@ -8,7 +8,25 @@ use base64::Engine;
 use jito_sdk_rust::JitoJsonRpcSDK;
 use serde_json::json;
 pub use shared::types::SubmissionRecord;
-use tracing::{error, info};
+use tracing::{error, info, warn};
+
+fn extract_bundle_id(response: &serde_json::Value) -> String {
+    if let Some(id) = response["result"].as_str() {
+        return id.to_string();
+    }
+
+    if let Some(id) = response["result"].as_array().and_then(|arr| arr.first()) {
+        if let Some(id) = id.as_str() {
+            return id.to_string();
+        }
+    }
+
+    if let Some(id) = response["result"]["bundle_id"].as_str() {
+        return id.to_string();
+    }
+
+    "unknown".to_string()
+}
 
 pub struct BundleSubmitter {
     blockhash_fetcher: BlockhashFetcher,
@@ -83,9 +101,11 @@ impl BundleSubmitter {
         // Submit bundle to Jito block engine
         let bundle_id = match self.jito_client.send_bundle(Some(params), None).await {
             Ok(response) => {
-                let id = response["result"].as_str().unwrap_or("unknown").to_string();
+                let id = extract_bundle_id(&response);
                 info!(bundle_id = %id, slot, "Bundle submitted");
-                info!(response = %response, "Raw Jito response for fault injection");
+                if id == "unknown" {
+                    warn!(response = %response, "Jito response missing bundle id");
+                }
                 id
             }
             Err(e) => {
