@@ -1,0 +1,66 @@
+syntax = "proto3";
+
+package heimdall;
+
+// A summary of a single bundle outcome for the AI agent
+message BundleOutcomeSummary {
+    string bundle_id = 1;
+    uint64 slot = 2;
+    string stage = 3;
+    string failure_reason = 4;
+    uint64 tip_lamports = 5;
+    string blockhash = 6;
+    uint64 submitted_at = 7;
+    // Three-field failure classification
+    string failure_stage = 8;
+    string recovery = 9;
+    // Retry lineage
+    string original_bundle_id = 10;
+    uint32 retry_attempt = 11;
+}
+
+// The operational snapshot streamed from L5 to L6
+message OperationalSnapshot {
+    uint64 current_slot = 1;
+    uint64 latest_finalized_slot = 2;
+    uint64 tip_median_lamports = 3;
+    repeated BundleOutcomeSummary recent_outcomes = 4;
+    uint32 active_bundle_count = 5;
+    uint64 snapshot_at = 6;
+    // Retry metrics
+    uint32 total_retries = 7;
+    uint32 total_retries_succeeded = 8;
+    uint32 total_retries_exhausted = 9;
+}
+
+// Empty request — L6 subscribes and receives a stream
+message SubscribeRequest {}
+
+// Retry request from L6 to L5
+message RetryRequest {
+  repeated BundleOutcomeSummary failed_bundles = 1;
+  bool refresh_blockhash = 2;
+  uint64 suggested_tip_lamports = 3;
+  string failure_classification = 4;
+  double confidence = 5;
+  string observed_risk = 6;
+}
+
+message RetryResponse {
+  bool accepted = 1;
+  string message = 2;
+}
+
+// Health check
+message HealthRequest {}
+message HealthResponse {
+  bool healthy = 1;
+  uint64 uptime_seconds = 2;
+  uint64 current_slot = 3;
+}
+
+service OperationalStateService {
+  rpc Subscribe(SubscribeRequest) returns (stream OperationalSnapshot);
+  rpc Retry(RetryRequest) returns (RetryResponse);
+  rpc Health(HealthRequest) returns (HealthResponse);
+}

@@ -1,0 +1,162 @@
+use tokio::sync::mpsc;
+pub type CandidateSender = mpsc::Sender<TransactionCandidate>;
+pub type CandidateReceiver = mpsc::Receiver<TransactionCandidate>;
+
+/// Represents a transaction candidate produced by L2
+/// and passed downstream to L3 via L5
+#[derive(Debug, Clone)]
+pub struct TransactionCandidate {
+    /// The slot this candidate was created at
+    pub slot: u64,
+    /// The validator leading this slot
+    pub leader: String,
+    /// Unix timestamp when candidate was created
+    pub created_at: u64,
+}
+
+impl TransactionCandidate {
+    pub fn new(slot: u64, leader: String) -> Self {
+        let created_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        Self {
+            slot,
+            leader,
+            created_at,
+        }
+    }
+}
+
+pub fn create_candidate_channel(buffer: usize) -> (CandidateSender, CandidateReceiver) {
+    mpsc::channel(buffer)
+}
+
+#[derive(Debug, Clone)]
+pub struct SubmissionRecord {
+    /// Jito bundle ID returned after submission
+    pub bundle_id: String,
+    /// Target slot this bundle was submitted for
+    pub slot: u64,
+    /// Validator identity leading the target slot
+    pub leader: String,
+    /// Tip amount paid in lamports
+    pub tip_lamports: u64,
+    /// Blockhash used when constructing the bundle
+    pub blockhash: String,
+    /// Signatures for the bundle transactions
+    pub transaction_signatures: Vec<String>,
+    /// Unix timestamp of submission
+    pub submitted_at: u64,
+    /// If this is a retry, the original bundle ID
+    pub original_bundle_id: Option<String>,
+    /// Retry attempt number (0 = first submission)
+    pub retry_attempt: u32,
+}
+
+impl SubmissionRecord {
+    pub fn new(
+        bundle_id: String,
+        slot: u64,
+        leader: String,
+        tip_lamports: u64,
+        blockhash: String,
+        transaction_signatures: Vec<String>,
+    ) -> Self {
+        let submitted_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        Self {
+            bundle_id,
+            slot,
+            leader,
+            tip_lamports,
+            blockhash,
+            transaction_signatures,
+            submitted_at,
+            original_bundle_id: None,
+            retry_attempt: 0,
+        }
+    }
+
+    pub fn as_retry(mut self, original_bundle_id: String, attempt: u32) -> Self {
+        self.original_bundle_id = Some(original_bundle_id);
+        self.retry_attempt = attempt;
+        self
+    }
+}
+
+pub type SubmissionSender = mpsc::Sender<SubmissionRecord>;
+pub type SubmissionReceiver = mpsc::Receiver<SubmissionRecord>;
+
+pub fn create_submission_channel(buffer: usize) -> (SubmissionSender, SubmissionReceiver) {
+    mpsc::channel(buffer)
+}
+
+/// Carries a slot update from L1 to L4 for bundle confirmation.
+/// Uses raw commitment u32 to avoid circular dependency with tracking crate.
+/// L4 converts to CommitmentStage internally.
+#[derive(Debug, Clone)]
+pub struct SlotConfirmation {
+    /// The slot number that progressed
+    pub slot: u64,
+    /// Raw commitment level: 0=Processed, 1=Confirmed, 2=Finalized
+    pub commitment: u32,
+    /// Optional transaction signature observed through Yellowstone
+    pub signature: Option<String>,
+}
+
+pub type ConfirmationSender = mpsc::Sender<SlotConfirmation>;
+pub type ConfirmationReceiver = mpsc::Receiver<SlotConfirmation>;
+
+pub fn create_confirmation_channel(buffer: usize) -> (ConfirmationSender, ConfirmationReceiver) {
+    mpsc::channel(buffer)
+}
+
+/// Carries tip median updates from L3 to L5
+#[derive(Debug, Clone)]
+pub struct TipUpdate {
+    pub median_lamports: u64,
+}
+
+pub type TipSender = mpsc::Sender<TipUpdate>;
+pub type TipReceiver = mpsc::Receiver<TipUpdate>;
+
+pub fn create_tip_channel(buffer: usize) -> (TipSender, TipReceiver) {
+    mpsc::channel(buffer)
+}
+
+/// Shared infrastructure configuration
+pub struct InfraConfig {
+    pub jito_url: String,
+    pub rpc_url: String,
+}
+
+/// Plain data struct representing a bundle outcome.
+/// Lives in shared so all crates can reference it
+/// without depending on protobuf-generated types.
+///
+/// Uses three-field failure classification:
+/// - `failure_reason`: machine-readable category (ExpiredBlockhash, FeeTooLow, etc.)
+/// - `failure_stage`: where the failure occurred (pre_submission, submission, execution, confirmation)
+/// - `recovery`: human-readable recovery guidance
+#[derive(Debug, Clone)]
+pub struct BundleOutcomeSummary {
+    pub bundle_id: String,
+    pub slot: u64,
+    pub stage: String,
+    pub failure_reason: String,
+    pub failure_stage: String,
+    pub recovery: String,
+    pub tip_lamports: u64,
+    pub blockhash: String,
+    pub submitted_at: u64,
+    /// Retry lineage: original bundle ID if this is a retry
+    pub original_bundle_id: String,
+    /// Retry attempt number (0 = first submission)
+    pub retry_attempt: u32,
+}
+

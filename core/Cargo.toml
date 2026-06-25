@@ -1,6 +1,10 @@
 [workspace]
 members = [
+    "intelligence",
     "observation",
     "shared",
+    "state",
+    "submission",
+    "tracking",
 ]
 resolver = "2"

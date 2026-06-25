@@ -1,0 +1,10 @@
+[package]
+name = "intelligence"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+shared = { path = "../shared" }
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+anyhow = "1"

@@ -4,19 +4,20 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-# Yellowstone gRPC client
-yellowstone-grpc-client = "13.1.0"
-yellowstone-grpc-proto = "12.4.0"
-
-# Async runtime
-tokio = { version = "1", features = ["full"] }
-
-# gRPC transport
-tonic = "0.14.6"
-
-# Env vars
+anyhow = "1"
+futures = "0.3"
 dotenvy = "0.15"
-
-# Logging
+solana-client = "4"
+solana-sdk = "4"
+tokio = { version = "1", features = ["full"] }
+tonic = { version = "0.14", features = ["tls-ring", "tls-native-roots"] }
 tracing = "0.1"
 tracing-subscriber = "0.3"
+yellowstone-grpc-client = "13"
+yellowstone-grpc-proto = "12"
+
+intelligence = { path = "../intelligence" }
+shared = { path = "../shared" }
+state = { path = "../state" }
+submission = { path = "../submission" }
+tracking = { path = "../tracking" }
